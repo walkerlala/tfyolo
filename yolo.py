@@ -37,6 +37,9 @@ import cv2
 import numpy as np
 import math
 import random
+import sys
+from time import gmtime, strftime
+from inspect import currentframe, getframeinfo
 import Queue
 from collections import namedtuple
 from backbone.inception_v1 import inception_v1
@@ -47,9 +50,14 @@ trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
 tf.app.flags.DEFINE_boolean("is_training", True, "To train or not to train.")
 
+tf.app.flags.DEFINE_boolean("freeze_backbone", True,
+        "Freeze the backbone network or not")
+
 tf.app.flags.DEFINE_string("check_point_file", "./inception_v1.ckpt",
         "Path of checkpoint file. Must come with its parent dir name, "
         "even it is in the current directory (eg, ./model.ckpt).")
+
+tf.app.flags.DEFINE_integer("batch_size", 50, "Batch size.")
 
 tf.app.flags.DEFINE_integer("num_of_classes", 1, "Number of classes.")
 
@@ -86,6 +94,12 @@ tf.app.flags.DEFINE_integer("image_size_min", 320,
 tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
         "Number of scales used to preprocess images. We want different size of "
         "input to our network to bring up its generality.")
+
+# It is pure pain to deal with tensor of variable length tensors (try and screw
+# up your life ;-). So we pack the tensor of ground truth bnx to make it 100.
+# Those fake ground truth bnx will all be 0 in it.
+tf.app.flags.DEFINE_integer("num_of_gt_bnx_fixed", 100,
+        "Numer of ground truth bounding box.")
 
 tf.app.flags.DEFINE_integer("num_of_steps", 20000,
         "Max num of step. -1 makes it infinite.")
@@ -131,22 +145,43 @@ class DatasetReader():
                     raise ValueError("Class name file incorrect format: %s" % line)
                 self.label_classname[parts[0]] = parts[1]
 
-    def next_batch(self, num=50, image_size=320):
+    def _scale_gt_and_pack_cell_ij(self, gt_box, image_size):
+        """ Scale tensor[1:5] with @image_size and pack [cell_i, cell_j]
+            at the end """
+        gt_box_0_1 = gt_box[0:1]
+        scaled_gt_box_1_5 = map(lambda x: x * image_size, gt_box[1:5])
+        cell_i = map(lambda x: int(x/32), scaled_gt_box_1_5[0:1])
+        cell_j = map(lambda y: int(y/32), scaled_gt_box_1_5[1:2])
+        # print("cell_i, cell_j: %s" % str((cell_i, cell_j)))
+
+        gt_box_0_1.extend(scaled_gt_box_1_5)
+        gt_box_0_1.extend(cell_i)
+        gt_box_0_1.extend(cell_j)
+        return gt_box_0_1
+
+    def next_batch(self, batch_size=50, image_size=320, num_of_anchor_boxes=5,
+                   num_of_classes=1, num_of_gt_bnx=100):
         """ Return next batch of images.
 
           Args:
-            num: Number of images to return.
+            batch_size: Number of images to return.
             image_size: Size of image. If the loaded image is not in this size,
-                        then it will be resized to [image_size, image_size, 3]
+                        then it will be resized to [image_size, image_size, 3].
+            num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
+            num_of_classes: See FLAGS.num_of_classes.
+            num_of_gt_bnx: Every `batch_ys` returned has a fixed number of ground
+                           truth bounding box (to make the training easier). If
+                           the actual ground truth does not has enough ground truth
+                           bounding box, we pack `batch_ys` to make it fixed-length.
           Return:
             batch_xs: A batch of image, i.e., a numpy array in shape
-                      [num, image_size, image_size, 3]
+                      [batch_size, image_size, image_size, 3]
             batch_ys: A batch of ground truth bounding box value, in shape
-                      [num, [-1, 5]].
+                      [batch_size, num_of_gt_bnx, 7] (that is, 5.. & cell_i & cell_j)
         """
         assert image_size % 32 == 0, "image_size should be multiple of 32"
         batch_xs_filename = []
-        for _ in range(num):
+        for _ in range(batch_size):
             batch_xs_filename.append(self.images_queue.get())
         for path in batch_xs_filename:
             self.images_queue.put(path)
@@ -172,6 +207,7 @@ class DatasetReader():
             batch_xs.append(im)
 
             yfile = open(y_path, "r")
+            gt_bnxs = []
             for line in yfile:
                 line = line.strip()
                 if not len(line) or line.startswith('#'): continue
@@ -182,7 +218,7 @@ class DatasetReader():
                 # NOTE we don't have to scale the coordinates, because a point
                 # at 0.7 in the original image would also appear at 0.7 at the
                 # scaled image.
-                label = int(label)
+                label = float(label)
                 x = float(x) # x coordinate of the box center
                 y = float(y) # y coordinate of the box center
                 w = float(w) # width of the box
@@ -192,23 +228,29 @@ class DatasetReader():
                         ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
                            str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
 
-                batch_ys.append(label)
-                batch_ys.append(x)
-                batch_ys.append(y)
-                batch_ys.append(w)
-                batch_ys.append(h)
+                _box = self._scale_gt_and_pack_cell_ij(
+                                    [label, x, y, w, h],
+                                    image_size
+                                )
+                gt_bnxs.append(_box)
 
-            # After reading labels from every single file, we add a -1 at the
-            # very end as the delimiter so that we can split this batch after it
-            # gets passed into a function.
-            batch_ys.append(-1)
+            assert len(gt_bnxs) < num_of_gt_bnx, "num_of_gt_bnx_fixed too small!"
+            num = num_of_gt_bnx - len(gt_bnxs)
+            for i in range(num):
+                # cell_i & cell_j are both set to -1.0 to prevent matching.
+                gt_bnxs.append([0,0,0,0,0,-1.0,-1.0])
+            batch_ys.append(gt_bnxs)
 
             yfile.close()
 
         batch_xs = np.array(batch_xs)
-        assert batch_xs.shape == (num, image_size, image_size, 3), \
-                "batch_xs shape mismatch"
         batch_ys = np.array(batch_ys)
+        assert batch_xs.shape == (batch_size, image_size, image_size, 3), \
+                "batch_xs shape mismatch. shape: %s, expected: %s" \
+                    % (str(batch_xs.shape), str((batch_size, image_size, image_size, 3)))
+        assert batch_ys.shape == (batch_size, num_of_gt_bnx, 7), \
+                "batch_ys shape mismatch. shape: %s, expected: %s" \
+                    % (str(batch_ys.shape), str((batch_size, image_size, image_size, 3)))
 
         tf.logging.info("Shape of batch_xs: " + str(batch_xs.shape))
         tf.logging.info("Shape of batch_ys: " + str(batch_ys.shape))
@@ -225,37 +267,6 @@ class YOLOLoss():
     def sigmoid(x):
         return math.exp(-np.logaddexp(0, -x))
         # return 1 / (1 + math.exp(-x))
-
-    @staticmethod
-    def split_into_tensor_list(ts, delimiter=-1):
-        """ split a tensor into a list of tensor.
-
-          Args:
-            ts: A 1-D tensor with delimiter in it.
-            delimiter: Which is used to split the 1-D tensor `ts'.
-          Return:
-            tensor_of_tensors: A tensor, which contains a list of 1-D tensor,
-                               which can be reshaped as [-1, 5]. Yah!
-        """
-        # pdb.set_trace()
-        all_bools = tf.equal(ts, delimiter)
-        # The len of the first dimension of `indexes' represent the number of
-        # index; the second, the real index respectively. For example, if
-        # `all_bools' is [True, False, True], then `indexes' will be [[0], [2]]
-        indexes = tf.where(all_bools)
-        indexes = tf.cast(tf.reshape(indexes, [-1]), tf.int32)
-        indexes_left = tf.concat([tf.constant([0]), indexes[:-1]], axis=0)
-        # something like [[0,7],[7,14]...]
-        indexes_tuples = tf.stack([indexes_left, indexes], axis=1)
-        # get [[0,1,2,3,4,5,6], [7,8,9,10,11,12,13]] from [[0,7],[7,14]...]
-        indexes_lists = tf.map_fn(lambda index_tp:
-                                        tf.range(index_tp[0], index_tp[1])
-                                  ,indexes_tuples,
-                                  infer_shape=False)
-        list_of_tensors = tf.map_fn(lambda index_list: tf.gather(ts, index_list),
-                                    indexes_lists)
-        tensor_of_tensors = list_of_tensors
-        return tensor_of_tensors
 
     @staticmethod
     def _intersec_len(x1, w1, x2, w2):
@@ -295,33 +306,32 @@ class YOLOLoss():
                                        num_of_anchor_boxes,
                                        num_of_classes):
 
-        l = gt_box[0]
-        x = gt_box[1]
-        y = gt_box[2]
-        w = gt_box[3]
-        h = gt_box[4]
         ious_list = []
+        # TODO for loop is expensive!
         for i in range(num_of_anchor_boxes):
             out = output[i]
-            loss = YOLOLoss._cal_iou(out[0:4], tf.stack([x,y,w,h]))
+            iou = YOLOLoss._cal_iou(out[0:4], gt_box[1:5])
             idx_tensor = tf.cast(tf.constant(i), tf.float32)
-            ious_list.append(tf.stack([idx_tensor, loss]))
+            ious_list.append(tf.stack([iou, idx_tensor]))
         ious_list_tensors = tf.stack(ious_list)
-        # return a tf.Tensor of [idx, iou]
-        ious_tp_max = tf.reduce_max(ious_list_tensors, 1)
-        idx = tf.cast(ious_tp_max[0], tf.int32)
+        ious_tp_max = tf.reduce_max(ious_list_tensors, 0)
+        idx = tf.cast(ious_tp_max[1], tf.int32)
         max_box = output[idx]
 
-        match_gt_loss = (tf.pow(max_box[0] - x, 2)
-                        + tf.pow(max_box[1] - y, 2)
-                        + tf.pow(tf.sqrt(max_box[2])-tf.sqrt(w), 2)
-                        + tf.pow(tf.sqrt(max_box[3])-tf.sqrt(h), 2)
-                        + tf.pow(max_box[4] - 1, 2)
-                        + tf.pow(max_box[5+tf.cast(l, tf.int32)] - 0, 2))
+        match_gt_loss = (tf.pow(max_box[0]-x, 2)
+                        + tf.pow(max_box[1]-y, 2)
+                        # TODO gradient of tf.sqrt will probably be -NaN
+                        # + tf.pow(tf.sqrt(max_box[2])-tf.sqrt(w), 2)
+                        # + tf.pow(tf.sqrt(max_box[3])-tf.sqrt(h), 2)
+                        + tf.pow(max_box[2]-w, 2)
+                        + tf.pow(max_box[3]-h, 2)
+                        + tf.pow(max_box[4]-1, 2)
+                        + tf.pow(max_box[5+tf.cast(gt_box[0], tf.int32)] - 0, 2))
         # for i range(num_of_classes):
             # if i == l: continue
             # match_gt_loss += math.pow(max_iou_pred[5 + i] - 0, 2)
             # pass
+
         return match_gt_loss
         # we just don't care the boxes that don't match...now...
         # For the box that matches the ground truth box, get the loss
@@ -336,30 +346,47 @@ class YOLOLoss():
     @staticmethod
     def _cal_cell_square_error(gt_box, output, cell_i, cell_j, feature_map_len,
                                num_of_anchor_boxes, num_of_classes):
-        l = gt_box[0]
-        x = gt_box[1]
-        y = gt_box[2]
-        w = gt_box[3]
-        h = gt_box[4]
-        gt_cell_i = gt_box[5]
-        gt_cell_j = gt_box[6]
-        return tf.cond(tf.logical_and(cell_i == gt_cell_i, cell_j == gt_cell_j),
-                       lambda: tf.constant(0.0),
-                       lambda: YOLOLoss._cal_cell_square_error_matched(
-                                                gt_box,
-                                                output,
-                                                feature_map_len,
-                                                num_of_anchor_boxes,
-                                                num_of_classes
-                                        ))
+        # l = gt_box[0]
+        # x = gt_box[1]
+        # y = gt_box[2]
+        # w = gt_box[3]
+        # h = gt_box[4]
+        # gt_cell_i = gt_box[5]
+        # gt_cell_j = gt_box[6]
+        result = tf.cond(tf.logical_and(tf.abs(cell_i - gt_box[5]) < 0.0001,
+                                        tf.abs(cell_j - gt_box[6]) < 0.0001),
+                         lambda: YOLOLoss._cal_cell_square_error_matched(
+                                               gt_box = gt_box,
+                                               output = output,
+                                               feature_map_len = feature_map_len,
+                                               num_of_anchor_boxes = num_of_anchor_boxes,
+                                               num_of_classes = num_of_classes
+                                          ),
+                         lambda: tf.constant(0.0))
+        # result = tf.Print(result, [l, x, y, w, h, gt_cell_i, gt_cell_j, cell_i, cell_j],
+                            # "[l, x, y, w, h, gt_cell_i, gt_cell_j, cell_i, cell_j]: ")
+        return result
 
     @staticmethod
-    def _cal_square_error(tensor, cell_i, cell_j, feature_map_len,
+    def _cal_square_error(tensor, cell_i, cell_j, feature_map_len, num_of_gt_bnx,
                           num_of_anchor_boxes, num_of_classes):
         """ The ground truth box may not appear in the same cell as the
             output. There is a cell_i/cell_j informatioin in @gt_box, and
             we know which cell the output belong to by @cell_i and @cell_j.
         """
+
+        print("_cal_square_error:linenumber: %s, time %s" % (
+                        str(getframeinfo(currentframe()).lineno),
+                        strftime("%H:%M:%S", gmtime())))
+
+        # Used to count which cell we are currently in, so we can use
+        # tf.map_fn() in _cal_image_loss() instead of a python-for-loop, which
+        # is expensive.
+        if not hasattr(YOLOLoss._cal_square_error, "_inner_cell_i"):
+            YOLOLoss._cal_square_error._inner_cell_i = 0
+        if not hasattr(YOLOLoss._cal_square_error, "_inner_cell_j"):
+            YOLOLoss._cal_square_error._inner_cell_j = 0
+
 
         output = tensor[0:num_of_anchor_boxes * (5+num_of_classes)]
         # TODO I don't get why I have to explicitly reshape it (if not,
@@ -368,25 +395,35 @@ class YOLOLoss():
         # output = tf.reshape(output, [num_of_anchor_boxes * (5+num_of_classes)])
         output = tf.reshape(output, [num_of_anchor_boxes, (5+num_of_classes)])
         ground_truth = tensor[num_of_anchor_boxes * (5+num_of_classes):]
-        ground_truth = tf.reshape(ground_truth, [-1, 7])
+        ground_truth = tf.reshape(ground_truth, [num_of_gt_bnx, 7])
+
         losses = \
             tf.map_fn(lambda gt_box:
                 YOLOLoss._cal_cell_square_error(
-                            gt_box,
-                            output,
-                            cell_i,
-                            cell_j,
-                            feature_map_len,
-                            num_of_anchor_boxes,
-                            num_of_classes
+                            gt_box = gt_box,
+                            output = output,
+                            cell_i = cell_i,
+                            cell_j = cell_j,
+                            # YOLOLoss._cal_square_error._inner_cell_i,
+                            # YOLOLoss._cal_square_error._inner_cell_j,
+                            feature_map_len = feature_map_len,
+                            num_of_anchor_boxes = num_of_anchor_boxes,
+                            num_of_classes = num_of_classes
                          )
             ,ground_truth)
         losses = tf.reduce_mean(losses)
+
+        # Advance to next cell
+        YOLOLoss._cal_square_error._inner_cell_j += 1
+        if YOLOLoss._cal_square_error._inner_cell_j >= feature_map_len:
+            YOLOLoss._cal_square_error._inner_cell_j = 0
+            YOLOLoss._cal_square_error._inner_cell_i += 1
+
         return losses
 
     @staticmethod
-    def _cal_image_loss(output_and_gt, feature_map_len, num_of_anchor_boxes,
-                        num_of_classes):
+    def _cal_image_loss(output_and_gt, feature_map_len, num_of_gt_bnx,
+                        num_of_anchor_boxes, num_of_classes):
         """ Same as calculate_loss(), except that now @output_and_gt only
             contains info for one image, and has shape
             (feature_map_len, feature_map_len, ?).
@@ -397,6 +434,7 @@ class YOLOLoss():
           Args:
             output_and_gt: Tensor of shape (feature_map_len, feature_map_len, ?)
             feature_map_len: Number of cells in a column/row of that image.
+            num_of_gt_bnx: See FLAGS.num_of_gt_bnx.
             num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
             num_of_classes: See FLAGS.num_of_classes.
 
@@ -404,35 +442,117 @@ class YOLOLoss():
         """
 
         _losses = []
+        # TODO optimize this for loop. For loop in tensorflow is expensive
         for i in range(0, feature_map_len):
             for j in range(0, feature_map_len):
                 ts = output_and_gt[i][j]
                 _losses.append(
                     YOLOLoss._cal_square_error(
-                                ts,
-                                i,
-                                j,
-                                feature_map_len,
-                                num_of_anchor_boxes,
-                                num_of_classes))
+                                tensor = ts,
+                                cell_i = i,
+                                cell_j = j,
+                                feature_map_len = feature_map_len,
+                                num_of_gt_bnx = num_of_gt_bnx,
+                                num_of_anchor_boxes = num_of_anchor_boxes,
+                                num_of_classes = num_of_classes))
         losses = tf.stack(_losses)
+        # We can use a for loop to create a list of tensor and then use
+        # tf.stack() to stack them together (because `feature_map_len'
+        # is a python variable instead of a tensor). But we don't do that!
+        # Python for loop is expensive in this situation
+#        losses = \
+#            tf.map_fn(lambda xdim:
+#                tf.map_fn(lambda ts:
+#                    YOLOLoss._cal_square_error(
+#                        ts,
+#                        feature_map_len = feature_map_len,
+#                        num_of_gt_bnx = num_of_gt_bnx,
+#                        num_of_anchor_boxes = num_of_anchor_boxes,
+#                        num_of_classes = num_of_classes)
+#                ,xdim)
+#            ,output_and_gt)
         return tf.reduce_sum(losses)
 
     @staticmethod
-    def calculate_loss(output, ground_truth, num_of_anchor_boxes, num_of_classes):
+    def _scale_box_relative_to_cell_center(box_and_incremental_nums,
+                                           image_size,
+                                           feature_map_len,
+                                           num_of_anchor_boxes,
+                                           num_of_classes):
+        """ Calculate x,y,w,h relative to the center of the cell,
+            such that:
+              - the top left corner of the gt will not shift
+                > 1*cellsize away from the cell center.
+              - w and h is sigmoid-ed and calculate relative to image_size
+
+          Args:
+            box: A tensor of length num_of_anchor_boxes * (5 + num_of_classes)
+                (which means we have to reshape it)
+            feature_map_len: Number of cell in the one row/column of the image.
+            num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
+            num_of_classes: See FLAGS.num_of_classes.
+          Return:
+            A tensor with all the coordinates scaled.
+        """
+
+        box = box_and_incremental_nums[0]
+        incremental_nums = box_and_incremental_nums[1]
+
+        # incremental_nums[0] should equals incremental_nums[1]
+        num = incremental_nums[0]-1
+        cell_i = tf.cast(num, tf.int32) % feature_map_len
+        cell_j = tf.cast(num, tf.int32) / feature_map_len
+        top_left_x = cell_i * 32
+        top_left_y = cell_j * 32
+        bottom_right_x = (cell_i + 1) * 32
+        bottom_right_y = (cell_j + 1) * 32
+        center_x = (top_left_x + bottom_right_x) / 2
+        center_y = (top_left_y + bottom_right_y) / 2
+
+        def _scale_box(bx, image_size, center_x, center_y):
+            _x = bx[0]
+            _y = bx[1]
+            _w = bx[2]
+            _h = bx[3]
+
+            # TODO why should these cast
+            x = tf.cast(center_x, tf.float32) + tf.sigmoid(_x) * 32
+            y = tf.cast(center_y, tf.float32) + tf.sigmoid(_y) * 32
+            w = tf.sigmoid(_w) * tf.cast(image_size, tf.float32)
+            h = tf.sigmoid(_h) * tf.cast(image_size, tf.float32)
+
+            p1 = tf.stack([x, y, w, h])
+            p2 = bx[4:5+num_of_classes]
+            return tf.concat([p1, p2], axis=0)
+        #--------- END -----
+
+        # tf.logging.info("##### Shape of box: %s" % str(box.shape))
+        boxes = tf.reshape(box, [num_of_anchor_boxes, 5 + num_of_classes])
+        boxes = \
+            tf.map_fn(lambda bx:
+                _scale_box(bx, image_size, center_x, center_y)
+            ,boxes)
+        boxes = tf.reshape(box, [-1])
+        return boxes
+
+    @staticmethod
+    def calculate_loss(output, ground_truth, batch_size, num_of_anchor_boxes,
+                       num_of_classes, num_of_gt_bnx):
         """ Calculate loss using the loss from yolov1 + yolov2.
 
           Args:
             output: Computed output from the network. In shape
-                    [batch_num,
+                    [batch_size,
                         image_size/32,
                             image_size/32,
-                                (num_of_anchor_boxes * (5 + C))]
-            ground_truth: Ground truth bounding boxes. In shape (batch_num, ).
-                          In each batch, all the labels (length 5) are flattened.
-                          We will split them here.
+                                (num_of_anchor_boxes * (5 + num_of_classes))]
+            ground_truth: Ground truth bounding boxes.
+                          In shape [batch_size, num_of_gt_bnx, 7].
+            batch_size: See FLAGS.batch_size.
             num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
             num_of_classes: See FLAGS.num_of_classes.
+            num_of_gt_bnx: See FLAGS.num_of_gt_bnx_fixed.
+
           Return:
               loss: The final loss (after tf.reduce_mean()).
         """
@@ -441,97 +561,38 @@ class YOLOLoss():
         assert output.shape[1] == output.shape[2], "Output tensor shape mismatch"
 
         # don't use tf.shape() here because it is dynamic. We are sure about its
-        # output's shape, so just use it here.
+        # output's shape, so we don't have to use that.
         feature_map_len = output.shape[1]
         image_size = feature_map_len*32
 
-        ground_truth = YOLOLoss.split_into_tensor_list(ground_truth)
-        ground_truth = tf.map_fn(lambda tensor: tf.reshape(tensor, [-1, 5]),
-                                 ground_truth)
-
-        # ----------------- Inner functions defs ----------------
-        def _scale_gt_with_image_size_and_pack_cell_ij(tensor, image_size):
-            """ Scale tensor[1:5] with @image_size and pack [cell_i, cell_j]
-                at the end """
-            tensor_0_1 = tensor[0:1]
-            scaled_tensor_1_5 = tf.map_fn(lambda x: x * image_size, tensor[1:5])
-            tensor = tf.concat([tensor_0_1, scaled_tensor_1_5], axis=0)
-            cell_i = tf.map_fn(lambda x: tf.cast(x/32, tf.int32), tensor[1:2])
-            cell_j = tf.map_fn(lambda y: tf.cast(y/32, tf.int32), tensor[2:3])
-            tensor = tf.concat([tensor, cell_i, cell_j], axis=0)
-            return tensor
-
-        def _scale_box_relative_to_cell_center(box_and_incremental_nums):
-            """ Calculate x,y,w,h relative to the center of the cell,
-                such that:
-                  - the top left corner of the gt will not shift
-                    > 1*cellsize away from the cell center.
-                  - w and h is sigmoid-ed and calculate relative to image_size
-
-              Args:
-                box: A tensor of length
-                       num_of_anchor_boxes * (5 + num_of_classes)
-                    (which means we have to reshape it)
-              Return:
-                A tensor with all the coordinates scaled.
-            """
-
-            box = box_and_incremental_nums[0]
-            incremental_nums = box_and_incremental_nums[1]
-
-            # incremental_nums[0] should equals incremental_nums[1]
-            num = incremental_nums[0]-1
-            cell_i = tf.cast(num, tf.int32) % feature_map_len
-            cell_j = tf.cast(num, tf.int32) / feature_map_len
-            top_left_x = cell_i * 32
-            top_left_y = cell_j * 32
-            bottom_right_x = (cell_i + 1) * 32
-            bottom_right_y = (cell_j + 1) * 32
-            center_x = (top_left_x + bottom_right_x) / 2
-            center_y = (top_left_y + bottom_right_y) / 2
-
-            def _scale_box(bx, image_size, center_x, center_y):
-                _x = bx[0]
-                _y = bx[1]
-                _w = bx[2]
-                _h = bx[3]
-
-                # TODO why should these cast
-                x = tf.cast(center_x, tf.float32) + tf.sigmoid(_x) * 32
-                y = tf.cast(center_y, tf.float32) + tf.sigmoid(_y) * 32
-                w = tf.sigmoid(_w) * tf.cast(image_size, tf.float32)
-                h = tf.sigmoid(_h) * tf.cast(image_size, tf.float32)
-
-                p1 = tf.stack([x, y, w, h])
-                p2 = bx[4:5+num_of_classes]
-                return tf.concat([p1, p2], axis=0)
-            #--------- END -----
-
-            # tf.logging.info("##### Shape of box: %s" % str(box.shape))
-            boxes = tf.reshape(box, [num_of_anchor_boxes, 5 + num_of_classes])
-            boxes = \
-                tf.map_fn(lambda bx:
-                    _scale_box(bx, image_size, center_x, center_y)
-                ,boxes)
-            boxes = tf.reshape(box, [-1])
-            return boxes
-        #--------------- END inner function defs ------------
-
-        # Scale the x,y coordinates. lambda blackhole!
+        # Flatten ground_truth to [batch_size, num_of_gt_bnx * 7] and stack the 1
+        # dimension, making it
+        #    [batch_size, image_size/32, image_size/32, num_of_gt_bnx * 7]
+        # That way we can bundle it with `output`.
+        #
+        def _stack_it(tensor, length):
+            lst = []
+            for i in range(length):
+                lst.append(tensor)
+            return tf.stack(lst)
+        #----------------------------
+        ground_truth = tf.reshape(ground_truth, [batch_size, num_of_gt_bnx * 7])
+        # We can use for loop, but, let's be cool!
         ground_truth = \
-            tf.map_fn(lambda list_of_tensors:
-                tf.map_fn(lambda tensor:
-                    _scale_gt_with_image_size_and_pack_cell_ij(tensor, image_size)
-                ,list_of_tensors)
+            tf.map_fn(lambda piece_in_batch:
+                _stack_it(_stack_it(piece_in_batch, feature_map_len), feature_map_len)
             ,ground_truth)
 
+        # Scale `output`
+        #
+        # lambda blackhole!
         all_zeros = tf.ones(tf.shape(output))
         incremental_nums = \
             tf.map_fn(lambda piece_in_batch:
                 tf.map_fn(lambda xdim:
                     tf.map_fn(lambda ydim:
                         tf.scan(lambda box1, box2: # use tf.scan
-                            tf.add(box1, box2 )
+                            tf.add(box1, box2)
                         ,ydim)
                     ,xdim)
                 ,piece_in_batch)
@@ -545,48 +606,34 @@ class YOLOLoss():
             tf.map_fn(lambda piece_in_batch:
                 tf.map_fn(lambda xdim:
                     tf.map_fn(lambda box_and_incremental_nums:
-                        _scale_box_relative_to_cell_center(box_and_incremental_nums)
+                        YOLOLoss._scale_box_relative_to_cell_center(
+                                    box_and_incremental_nums,
+                                    image_size,
+                                    feature_map_len,
+                                    num_of_anchor_boxes,
+                                    num_of_classes
+                                 )
                     ,xdim)
                 ,piece_in_batch)
             ,output_pack)
-
 
         output_shape = tf.shape(output)
         output = tf.reshape(output_scaled, [tf.shape(output)[0], # dynamic shape
                                             output.shape[1],     # static shape
                                             output.shape[2],     # static shape
                                             num_of_anchor_boxes * (5 + num_of_classes)])
-
         # shape of output:
         #   [?, feature_map_len, feature_map_len, num_of_anchor_boxes * (5 + num_of_classes))
-        # shape of ground_truth: (?, ?, 7)
-        # 
-        # Let's reshape ground_truth to be (?, ?) so that we can tf.stack
-        # output with ground_truth and make a iteration into it.
-        ground_truth = \
-            tf.map_fn(lambda piece_in_batch:
-                tf.reshape(piece_in_batch, [-1])
-            ,ground_truth)
-
-        # make ground_truth the same shape as output, that is,
-        #   (?, feature_map_len, feature_map_len, ?)
-        def _stack_it(tensor, length):
-            lst = []
-            for i in range(length):
-                lst.append(tensor)
-            return tf.stack(lst)
-        #--------- END -------------
-        # pdb.set_trace()
-        ground_truth = \
-            tf.map_fn(lambda piece_in_batch:
-                _stack_it(_stack_it(piece_in_batch, feature_map_len), feature_map_len)
-            ,ground_truth)
+        # shape of ground_truth:
+        #   [?, feature_map_len, feature_map_len, num_of_gt_bnx * 7]
 
         # concat ground_truth and output to make a tensor of shape 
         #   (?, feature_map_len, feature_map_len, ?)
+        #
         # (Let's assume 30 == num_of_anchor_boxes * (5+num_of_classes) )
         # At the very end dimension, the 30 tensors from output starts first,
-        # followed are those tensors from ground_truth.
+        # followed with those tensors from ground_truth.
+        #
         # TODO check that why we have to cast
         output = tf.cast(output, tf.float32)
         ground_truth = tf.cast(ground_truth, tf.float32)
@@ -594,18 +641,25 @@ class YOLOLoss():
 
         losses = \
             tf.map_fn(lambda piece_output_and_gt:
-                YOLOLoss._cal_image_loss(piece_output_and_gt,
-                                         feature_map_len,
-                                         num_of_anchor_boxes,
-                                         num_of_classes)
+                YOLOLoss._cal_image_loss(
+                            output_and_gt = piece_output_and_gt,
+                            feature_map_len = feature_map_len,
+                            num_of_gt_bnx = num_of_gt_bnx,
+                            num_of_anchor_boxes = num_of_anchor_boxes,
+                            num_of_classes = num_of_classes)
             ,output_and_ground_truth)
 
         loss = tf.reduce_mean(losses)
+
+        print("END building loss:linenumber: %s, time %s" % (
+                        str(getframeinfo(currentframe()).lineno),
+                        strftime("%H:%M:%S", gmtime())))
         return loss
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
-def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1, reuse=tf.AUTO_REUSE):
+def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1, reuse=tf.AUTO_REUSE,
+           freeze_backbone=True):
     """ This architecture of YOLO is not strictly the same as in those paper.
     We use inceptionv1 as a starting point, and then add necessary layers on
     top of it. Therefore, we name it `YOLO (version x)`.
@@ -622,7 +676,8 @@ def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1, reuse=tf.AUTO_REUSE)
     """
     with slim.arg_scope(inception_arg_scope()):
         net, endpoints = inception_v1(images, num_classes=None,
-                                      is_training=True, global_pool=False,
+                                      is_training=not freeze_backbone,
+                                      global_pool=False,
                                       reuse=reuse)
 
     # Get inception v1 variable here, because the network arch will change
@@ -668,19 +723,23 @@ def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1, reuse=tf.AUTO_REUSE)
 
     return net, vars_to_restore
 
-def train(training_file_list, class_name_file, num_of_classes, num_of_image_scales, image_size_min,
-          num_of_anchor_boxes, num_of_steps, check_point_file):
+def train(training_file_list, class_name_file, batch_size, num_of_classes,
+          num_of_image_scales, image_size_min, num_of_anchor_boxes,
+          num_of_gt_bnx_fixed, num_of_steps, check_point_file,
+          freeze_backbone=True):
     """ Train the YOLOvx network.
 
       Args:
           training_file_list: See FLAGS.training_file_list.
           class_name_file: See FLAGS.class_name_file.
+          batch_size: See FLAGS.batch_size.
           num_of_classes: See FLAGS.num_of_classes.
           num_of_image_scales: See FLAGS.num_of_image_scales.
           image_size_min: See FLAGS.image_size_min.
           num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes
           num_of_steps: See FLAGS.num_of_steps.
           check_point_file: See FLAGS.check_point_file.
+          freeze_backbone: See FLAGS.freeze_backbone.
       Return:
           None.
     """
@@ -688,91 +747,89 @@ def train(training_file_list, class_name_file, num_of_classes, num_of_image_scal
     # TODO we should not bundle `vars_to_restore' in io_info. A better way
     # will be to split apart the inception module and load its weights only once.
     io_info = namedtuple('io_info', ['size', 'input_tensor', 'output_tensor',
-                                     'ground_truth', 'vars_to_restore'])
+                                     'ground_truth', 'vars_to_restore', 
+                                     'loss', 'train_step'])
     variable_size_io_map = []
     variable_sizes = []
     for i in range(num_of_image_scales):
         variable_sizes.append(image_size_min + i*32)
-    for size in variable_sizes:
+
+    tf.logging.info("Building tensorflow graph...")
+
+    for idx, size in enumerate(variable_sizes):
         assert size % 32 == 0, ("Image size should be multiple of 32. "
                                 "FLAGS.image_size_min may be wrong.")
         _x = tf.placeholder(tf.float32, [None, size, size, 3])
         _y, _vars_to_restore = YOLOvx(_x)
         # 7: label, x, y, w, h, cell_i, cell_j
-        _y_gt = tf.placeholder(tf.float32, [None])
+        _y_gt = tf.placeholder(tf.float32, [None, num_of_gt_bnx_fixed, 7])
+
+        loss = YOLOLoss.calculate_loss(
+                                _y,
+                                _y_gt,
+                                batch_size=batch_size,
+                                num_of_anchor_boxes=num_of_anchor_boxes,
+                                num_of_classes=num_of_classes,
+                                num_of_gt_bnx=num_of_gt_bnx_fixed
+                            )
+
+        train_step = tf.train.AdamOptimizer(1e-4).minimize(loss)
+
         variable_size_io_map.append(io_info(size=size,
                                             input_tensor=_x,
                                             output_tensor=_y,
                                             ground_truth=_y_gt,
-                                            vars_to_restore=_vars_to_restore))
+                                            vars_to_restore=_vars_to_restore,
+                                            loss=loss,
+                                            train_step=train_step))
+
+        sys.stdout.write("\rFinished building network loss/train_step: %d" % idx)
+
+    tf.logging.info("All network loss/train_step built! Yah!")
 
     # load images and labels
     reader = DatasetReader(training_file_list, class_name_file, num_of_classes)
 
-    # TODO Seriously, what is the difference?
-    # initializer = tf.global_variables_initializer()
-    initializer = tf.initialize_all_variables()
-
-    tf.logging.info("Before session run")
-    io_map_idx = 0
-    already_loaded_ckpt = False # TODO I hate this flag!
+    initializer = tf.global_variables_initializer()
 
     sess = tf.Session()
 
     # TODO If run here, will the checkpoint be loaded below?
     sess.run(initializer)
 
+    io_map_idx = 0
+    already_loaded_ckpt = False # TODO I hate this flag!
     for i in range(20000): #TODO FLAGS.num_of_steps
         # `size' is the size of input image, not the final feature map size
         size = variable_size_io_map[io_map_idx].size
-        _x = variable_size_io_map[io_map_idx].input_tensor
-        _y = variable_size_io_map[io_map_idx].output_tensor
-        _y_gt = variable_size_io_map[io_map_idx].ground_truth
+        # _x = variable_size_io_map[io_map_idx].input_tensor
+        # _y = variable_size_io_map[io_map_idx].output_tensor
+        # _y_gt = variable_size_io_map[io_map_idx].ground_truth
         _vars_to_restore = variable_size_io_map[io_map_idx].vars_to_restore
+        loss = variable_size_io_map[io_map_idx].loss
+        train_step = variable_size_io_map[io_map_idx].train_step
+
         # load initial weights of the inception module
         if not already_loaded_ckpt:
             restorer = tf.train.Saver(_vars_to_restore)
             restorer.restore(sess, check_point_file)
+            tf.logging.info("Checkpoint restored!")
             already_loaded_ckpt = True
 
-        batch_xs, batch_ys = reader.next_batch(num=50, image_size=size)
-
-        # TODO Build it first, not dynamically here
-        loss = YOLOLoss.calculate_loss(
-                                _y,
-                                _y_gt,
-                                num_of_anchor_boxes,
-                                num_of_classes
+        batch_xs, batch_ys = reader.next_batch(
+                                batch_size=batch_size,
+                                image_size=size,
+                                num_of_anchor_boxes=num_of_anchor_boxes,
+                                num_of_classes=num_of_classes,
+                                num_of_gt_bnx=num_of_gt_bnx_fixed
                             )
 
-        train_step = tf.train.AdamOptimizer(1e-4).minimize(loss)
-        # trainable_vars = tf.trainable_variables()
-        # opt = tf.train.GradientDescentOptimizer(1e-4)
-        # print(tf.gradients(loss, trainable_vars))
-        # grads_and_vars = opt.compute_gradients(loss, trainable_vars)
-        # print(grads_and_vars)
-        # # eta = opt._learning_rate
-        # train_step = opt.apply_gradients(grads_and_vars)
-        # global_step = tf.Variable(0, trainable=False)
-        # starter_learning_rate = 0.01
-        # learning_rate = tf.train.exponential_decay(
-        #         learning_rate = starter_learning_rate,
-        #         global_step = global_step,
-        #         decay_steps = 100000,
-        #         decay_rate = 0.96,
-        #         staircase=True
-        #     )
-        # train_step = (
-        #         tf.train.GradientDescentOptimizer(learning_rate)
-        #         .minimize(cross_entropy, global_step=global_step)
-        #     )
-
-        tf.logging.info("Network loss/train_step built! Yah!")
-
-        # _, loss_val = sess.run([train_step, loss],
-                               # feed_dict={_x: batch_xs, _y_gt: batch_ys})
-        loss_val = sess.run([loss],
-                            feed_dict={_x: batch_xs, _y_gt: batch_ys})
+        sys.stdout.write("Running train_step[%d]..." % i)
+        # sess.run(initializer)
+        _, loss_val = sess.run([train_step, loss],
+                               feed_dict={_x: batch_xs, _y_gt: batch_ys})
+        # loss_val = sess.run([loss],
+                            # feed_dict={_x: batch_xs, _y_gt: batch_ys})
 
         tf.logging.info("LossVal: " + str(loss_val))
 
@@ -784,14 +841,18 @@ def main(_):
 
     if FLAGS.is_training:
         tf.logging.info("yolo.py started in training mode. Starting to train...")
-        train(FLAGS.training_file_list,
-              FLAGS.class_name_file,
-              FLAGS.num_of_classes,
-              FLAGS.num_of_image_scales,
-              FLAGS.image_size_min,
-              FLAGS.num_of_anchor_boxes,
-              FLAGS.num_of_steps,
-              FLAGS.check_point_file)
+        train(
+            training_file_list    = FLAGS.training_file_list,
+              class_name_file     = FLAGS.class_name_file,
+              batch_size          = FLAGS.batch_size,
+              num_of_classes      = FLAGS.num_of_classes,
+              num_of_image_scales = FLAGS.num_of_image_scales,
+              image_size_min      = FLAGS.image_size_min,
+              num_of_anchor_boxes = FLAGS.num_of_anchor_boxes,
+              num_of_gt_bnx_fixed = FLAGS.num_of_gt_bnx_fixed,
+              num_of_steps        = FLAGS.num_of_steps,
+              check_point_file    = FLAGS.check_point_file,
+              freeze_backbone     = FLAGS.freeze_backbone)
     else:
         tf.logging.info("What do you want to do?")
 
