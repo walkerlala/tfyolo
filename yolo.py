@@ -152,7 +152,6 @@ class DatasetReader():
         scaled_gt_box_1_5 = map(lambda x: x * image_size, gt_box[1:5])
         cell_i = map(lambda x: int(x/32), scaled_gt_box_1_5[0:1])
         cell_j = map(lambda y: int(y/32), scaled_gt_box_1_5[1:2])
-        # print("cell_i, cell_j: %s" % str((cell_i, cell_j)))
 
         gt_box_0_1.extend(scaled_gt_box_1_5)
         gt_box_0_1.extend(cell_i)
@@ -306,14 +305,19 @@ class YOLOLoss():
                                        num_of_anchor_boxes,
                                        num_of_classes):
 
+        l = gt_box[0]
+        x = gt_box[1]
+        y = gt_box[2]
+        w = gt_box[3]
+        h = gt_box[4]
         ious_list = []
-        # TODO for loop is expensive!
         for i in range(num_of_anchor_boxes):
             out = output[i]
-            iou = YOLOLoss._cal_iou(out[0:4], gt_box[1:5])
+            iou = YOLOLoss._cal_iou(out[0:4], tf.stack([x,y,w,h]))
             idx_tensor = tf.cast(tf.constant(i), tf.float32)
             ious_list.append(tf.stack([iou, idx_tensor]))
         ious_list_tensors = tf.stack(ious_list)
+        # return a tf.Tensor of [idx, iou]
         ious_tp_max = tf.reduce_max(ious_list_tensors, 0)
         idx = tf.cast(ious_tp_max[1], tf.int32)
         max_box = output[idx]
@@ -326,12 +330,15 @@ class YOLOLoss():
                         + tf.pow(max_box[2]-w, 2)
                         + tf.pow(max_box[3]-h, 2)
                         + tf.pow(max_box[4]-1, 2)
-                        + tf.pow(max_box[5+tf.cast(gt_box[0], tf.int32)] - 0, 2))
+                        + tf.pow(max_box[5+tf.cast(l, tf.int32)] - 0, 2))
         # for i range(num_of_classes):
             # if i == l: continue
             # match_gt_loss += math.pow(max_iou_pred[5 + i] - 0, 2)
             # pass
-
+        # match_gt_loss = tf.Print(match_gt_loss,
+                                # [match_gt_loss, l, x, y, w, h,
+                                 # max_box[0], max_box[1], max_box[2], max_box[3], max_box[4]],
+                                # "match_gt_loss & l & x & y & w & h | mb[0], mb[1], mb[2], mb[3], mb[4]: ")
         return match_gt_loss
         # we just don't care the boxes that don't match...now...
         # For the box that matches the ground truth box, get the loss
@@ -353,8 +360,8 @@ class YOLOLoss():
         # h = gt_box[4]
         # gt_cell_i = gt_box[5]
         # gt_cell_j = gt_box[6]
-        result = tf.cond(tf.logical_and(tf.abs(cell_i - gt_box[5]) < 0.0001,
-                                        tf.abs(cell_j - gt_box[6]) < 0.0001),
+        result = tf.cond(tf.logical_and(tf.abs(tf.cast(cell_i, tf.float32) - gt_box[5]) < 0.0001,
+                                        tf.abs(tf.cast(cell_j, tf.float32) - gt_box[6]) < 0.0001),
                          lambda: YOLOLoss._cal_cell_square_error_matched(
                                                gt_box = gt_box,
                                                output = output,
@@ -368,33 +375,17 @@ class YOLOLoss():
         return result
 
     @staticmethod
-    def _cal_square_error(tensor, cell_i, cell_j, feature_map_len, num_of_gt_bnx,
+    def _cal_square_error(tensor, feature_map_len, num_of_gt_bnx,
                           num_of_anchor_boxes, num_of_classes):
         """ The ground truth box may not appear in the same cell as the
             output. There is a cell_i/cell_j informatioin in @gt_box, and
             we know which cell the output belong to by @cell_i and @cell_j.
         """
 
-        print("_cal_square_error:linenumber: %s, time %s" % (
-                        str(getframeinfo(currentframe()).lineno),
-                        strftime("%H:%M:%S", gmtime())))
-
-        # Used to count which cell we are currently in, so we can use
-        # tf.map_fn() in _cal_image_loss() instead of a python-for-loop, which
-        # is expensive.
-        if not hasattr(YOLOLoss._cal_square_error, "_inner_cell_i"):
-            YOLOLoss._cal_square_error._inner_cell_i = 0
-        if not hasattr(YOLOLoss._cal_square_error, "_inner_cell_j"):
-            YOLOLoss._cal_square_error._inner_cell_j = 0
-
-
-        output = tensor[0:num_of_anchor_boxes * (5+num_of_classes)]
-        # TODO I don't get why I have to explicitly reshape it (if not,
-        # output will have shape (?, )
-        #
-        # output = tf.reshape(output, [num_of_anchor_boxes * (5+num_of_classes)])
+        cell_ij = tensor[0:1][0]
+        output = tensor[1:1+num_of_anchor_boxes * (5+num_of_classes)]
         output = tf.reshape(output, [num_of_anchor_boxes, (5+num_of_classes)])
-        ground_truth = tensor[num_of_anchor_boxes * (5+num_of_classes):]
+        ground_truth = tensor[1+num_of_anchor_boxes * (5+num_of_classes):]
         ground_truth = tf.reshape(ground_truth, [num_of_gt_bnx, 7])
 
         losses = \
@@ -402,22 +393,14 @@ class YOLOLoss():
                 YOLOLoss._cal_cell_square_error(
                             gt_box = gt_box,
                             output = output,
-                            cell_i = cell_i,
-                            cell_j = cell_j,
-                            # YOLOLoss._cal_square_error._inner_cell_i,
-                            # YOLOLoss._cal_square_error._inner_cell_j,
+                            cell_i = tf.cast(cell_ij, tf.int32) / feature_map_len,
+                            cell_j = tf.cast(cell_ij, tf.int32) % feature_map_len,
                             feature_map_len = feature_map_len,
                             num_of_anchor_boxes = num_of_anchor_boxes,
                             num_of_classes = num_of_classes
                          )
             ,ground_truth)
         losses = tf.reduce_mean(losses)
-
-        # Advance to next cell
-        YOLOLoss._cal_square_error._inner_cell_j += 1
-        if YOLOLoss._cal_square_error._inner_cell_j >= feature_map_len:
-            YOLOLoss._cal_square_error._inner_cell_j = 0
-            YOLOLoss._cal_square_error._inner_cell_i += 1
 
         return losses
 
@@ -441,36 +424,47 @@ class YOLOLoss():
           Return: Loss for this image.
         """
 
-        _losses = []
-        # TODO optimize this for loop. For loop in tensorflow is expensive
-        for i in range(0, feature_map_len):
-            for j in range(0, feature_map_len):
-                ts = output_and_gt[i][j]
-                _losses.append(
+        # We can use
+        #   for i in range(0, feature_map_len):
+        #       for j in range(0, feature_map_len):
+        #           tensor = output_and_gt[i][j]
+        #           ...
+        # to iterate into `output_and_gt' and manipulate every single tensor.
+        # But this for loop is expensive when building the network, because
+        # it run feature_map_len*feature_map_len time. If turned into a lambda,
+        # it only run once when building the network. So, all we have to do is
+        # to get (i,j) when using lambda. To do that, we pack
+        # (i*feature_map_len+j) into the last dimension of `output_and_gt'.
+        indexes = tf.reshape(
+                        tf.cast(tf.constant(range(feature_map_len*feature_map_len)), tf.float32),
+                        [feature_map_len, feature_map_len, 1]
+                    )
+        output_and_gt = tf.concat([indexes, output_and_gt], axis=-1)
+        losses = \
+            tf.map_fn(lambda xdim:
+                tf.map_fn(lambda ts:
                     YOLOLoss._cal_square_error(
-                                tensor = ts,
-                                cell_i = i,
-                                cell_j = j,
-                                feature_map_len = feature_map_len,
-                                num_of_gt_bnx = num_of_gt_bnx,
-                                num_of_anchor_boxes = num_of_anchor_boxes,
-                                num_of_classes = num_of_classes))
-        losses = tf.stack(_losses)
-        # We can use a for loop to create a list of tensor and then use
-        # tf.stack() to stack them together (because `feature_map_len'
-        # is a python variable instead of a tensor). But we don't do that!
-        # Python for loop is expensive in this situation
-#        losses = \
-#            tf.map_fn(lambda xdim:
-#                tf.map_fn(lambda ts:
+                        tensor=ts,
+                        feature_map_len=feature_map_len,
+                        num_of_gt_bnx=num_of_gt_bnx,
+                        num_of_anchor_boxes=num_of_anchor_boxes,
+                        num_of_classes=num_of_classes)
+                ,xdim)
+            ,output_and_gt)
+#        _losses = []
+#        for i in range(0, feature_map_len):
+#            for j in range(0, feature_map_len):
+#                ts = output_and_gt[i][j]
+#                _losses.append(
 #                    YOLOLoss._cal_square_error(
-#                        ts,
-#                        feature_map_len = feature_map_len,
-#                        num_of_gt_bnx = num_of_gt_bnx,
-#                        num_of_anchor_boxes = num_of_anchor_boxes,
-#                        num_of_classes = num_of_classes)
-#                ,xdim)
-#            ,output_and_gt)
+#                                tensor = ts,
+#                                cell_i = i,
+#                                cell_j = j,
+#                                feature_map_len = feature_map_len,
+#                                num_of_gt_bnx = num_of_gt_bnx,
+#                                num_of_anchor_boxes = num_of_anchor_boxes,
+#                                num_of_classes = num_of_classes))
+#        losses = tf.stack(_losses)
         return tf.reduce_sum(losses)
 
     @staticmethod
@@ -569,15 +563,10 @@ class YOLOLoss():
         # dimension, making it
         #    [batch_size, image_size/32, image_size/32, num_of_gt_bnx * 7]
         # That way we can bundle it with `output`.
-        #
         def _stack_it(tensor, length):
-            lst = []
-            for i in range(length):
-                lst.append(tensor)
-            return tf.stack(lst)
-        #----------------------------
+            return tf.stack([tensor for i in range(length)])
+        #-------------------
         ground_truth = tf.reshape(ground_truth, [batch_size, num_of_gt_bnx * 7])
-        # We can use for loop, but, let's be cool!
         ground_truth = \
             tf.map_fn(lambda piece_in_batch:
                 _stack_it(_stack_it(piece_in_batch, feature_map_len), feature_map_len)
@@ -651,9 +640,6 @@ class YOLOLoss():
 
         loss = tf.reduce_mean(losses)
 
-        print("END building loss:linenumber: %s, time %s" % (
-                        str(getframeinfo(currentframe()).lineno),
-                        strftime("%H:%M:%S", gmtime())))
         return loss
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
@@ -756,6 +742,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
 
     tf.logging.info("Building tensorflow graph...")
 
+    # with tf.device('/device:GPU:0'):
     for idx, size in enumerate(variable_sizes):
         assert size % 32 == 0, ("Image size should be multiple of 32. "
                                 "FLAGS.image_size_min may be wrong.")
@@ -783,7 +770,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
                                             loss=loss,
                                             train_step=train_step))
 
-        sys.stdout.write("\rFinished building network loss/train_step: %d" % idx)
+        tf.logging.info("\rFinished building network loss/train_step: %d" % idx)
 
     tf.logging.info("All network loss/train_step built! Yah!")
 
@@ -792,7 +779,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
 
     initializer = tf.global_variables_initializer()
 
-    sess = tf.Session()
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True,
+                                            log_device_placement=True))
 
     # TODO If run here, will the checkpoint be loaded below?
     sess.run(initializer)
@@ -825,6 +813,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
                             )
 
         sys.stdout.write("Running train_step[%d]..." % i)
+        sys.stdout.flush()
         # sess.run(initializer)
         _, loss_val = sess.run([train_step, loss],
                                feed_dict={_x: batch_xs, _y_gt: batch_ys})
