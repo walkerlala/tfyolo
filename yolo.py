@@ -252,6 +252,9 @@ class DatasetReader():
                         ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
                            str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
 
+
+                # box = [label, x, y, w, h]
+                # cell_i, cell_j = self._get_cell_ij(box, image_size)
                 (box, cell_i, cell_j) = self._scale_gt_and_get_cell_ij(
                                             [label, x, y, w, h],
                                             image_size
@@ -370,21 +373,20 @@ class YOLOLoss():
             # pass
 
     @staticmethod
-    def calculate_loss_loop(idx, boxes, losses, batch_size, row_num):
+    def calculate_loss_loop(idx, boxes, losses):
         # TODO
         num_of_anchor_boxes = 5
         num_of_classes = 1
         num_of_gt_bnx_per_cell = 10
 
-        image_size = tf.cast(row_num*32, tf.float32)
-
         box = boxes[idx]
 
         split_num = num_of_anchor_boxes*(5+num_of_classes)
-        op_boxes = boxes[0:split_num]
+        op_boxes = box[0:split_num]
         op_boxes = tf.reshape(op_boxes, [num_of_anchor_boxes, 5+num_of_classes])
-        ground_truth = boxes[split_num:]
+        ground_truth = box[split_num:]
         ground_truth = tf.reshape(ground_truth, [num_of_gt_bnx_per_cell, 5])
+        # ground_truth = tf.Print(ground_truth, [ground_truth], "ground_truth print: ")
 
         gt_losses = []
         for i in range(num_of_gt_bnx_per_cell):
@@ -398,12 +400,13 @@ class YOLOLoss():
             for j in range(num_of_anchor_boxes):
                 out = op_boxes[j]
                 iou = YOLOLoss._cal_iou(out[0:4], tf.stack([x,y,w,h]))
-                idx_tensor = tf.cast(tf.constant(i), tf.float32)
+                idx_tensor = tf.cast(tf.constant(j), tf.float32)
                 ious_list.append(tf.stack([iou, idx_tensor]))
             ious_list_tensors = tf.stack(ious_list)
             ious_tp_max = tf.reduce_max(ious_list_tensors, 0)
-            idx = tf.cast(ious_tp_max[1], tf.int32)
-            max_box = op_boxes[idx]
+            index = tf.cast(ious_tp_max[1], tf.int32)
+            max_box = op_boxes[index]
+            max_box = op_boxes[0]
 
             match_gt_loss = (tf.pow(max_box[0]-x, 2)
                             + tf.pow(max_box[1]-y, 2)
@@ -422,9 +425,10 @@ class YOLOLoss():
                 # pass
             gt_losses.append(match_gt_loss)
 
+
         loss = tf.reduce_sum(tf.stack(gt_losses))
         losses_ = tf.concat([losses[0:idx], tf.stack([tf.stack([loss])]), losses[idx+1:]], axis=0)
-        return (idx+1, boxes, losses_, batch_size, row_num)
+        return (idx+1, boxes, losses_)
 
     @staticmethod
     def calculate_loss(output, ground_truth, batch_size, num_of_anchor_boxes,
@@ -471,11 +475,11 @@ class YOLOLoss():
                     [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
                 )
         losses = tf.reduce_sum(tf.zeros_like(output_and_ground_truth), axis=-1, keepdims=True)
-        _0, output_and_ground_truth, final_losses, _02, _03 = \
+        _0, output_and_ground_truth, final_losses = \
                 tf.while_loop(
-                        lambda idx, boxes, _1, _2, _3: idx < batch_size*row_num*row_num,
+                        lambda idx, boxes, _1 : idx < batch_size*row_num*row_num,
                         YOLOLoss.calculate_loss_loop,
-                        [tf.constant(0), output_and_ground_truth, losses, batch_size, row_num])
+                        [tf.constant(0), output_and_ground_truth, losses])
 
         loss = tf.reduce_mean(final_losses)
 
@@ -595,20 +599,22 @@ def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1,
                 row_num)
     #-------------------------------
 
+    net = tf.Print(net, [net], "net...")
     # scale the output here
     #
     # flatten the whole net and only keep the last dimension.
-    net_shape = tf.shape(net)
-    batch_size = net_shape[0]
-    row_num = net_shape[1]
-    net = tf.reshape(net, shape=[-1, num_of_anchor_boxes*(5+num_of_classes)])
-    _0, net, _01, _02 = \
-        tf.while_loop(
-            lambda i, network, _1, _2: i < batch_size*row_num*row_num,
-            _scale_output_body,
-            [tf.constant(0), net, batch_size, row_num]
-        )
-    net = tf.reshape(net, shape=net_shape)
+#    net_shape = tf.shape(net)
+#    batch_size = net_shape[0]
+#    row_num = net_shape[1]
+#    net = tf.reshape(net, shape=[-1, num_of_anchor_boxes*(5+num_of_classes)])
+#    _0, net, _01, _02 = \
+#        tf.while_loop(
+#            lambda i, network, _1, _2: i < batch_size*row_num*row_num,
+#            _scale_output_body,
+#            [tf.constant(0), net, batch_size, row_num]
+#        )
+#    net = tf.reshape(net, shape=net_shape)
+    net = tf.Print(net, [net], "net again...")
 
     return net, vars_to_restore
 
@@ -669,7 +675,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
     run_option = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
     run_metadata = tf.RunMetadata()
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
-                                            log_device_placement=True))
+                                            log_device_placement=False))
 
     merged_summary = tf.summary.merge_all()
     train_writer = tf.summary.FileWriter("/tmp/yolotraining", sess.graph)
@@ -697,7 +703,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         sys.stdout.write("Running train_step[%d]..." % idx)
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        _, loss_val = sess.run([train_step, loss], feed_dict={_x:batch_xs, _y_gt:batch_ys})
+        loss_val = sess.run([loss], feed_dict={_x:batch_xs, _y_gt:batch_ys})
         # merged_summary_trained, _2, loss_val = sess.run(
                             # [merged_summary, train_step, loss],
                             # feed_dict={_x: batch_xs, _y_gt: batch_ys},
