@@ -100,7 +100,7 @@ tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
 # It is pure pain to deal with tensor of variable length tensors (try and screw
 # up your life ;-). So we pack each cell with a fixed number of ground truth
 # bounding box.
-tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 10,
+tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 20,
         "Numer of ground truth bounding box.")
 
 tf.app.flags.DEFINE_integer("num_of_steps", 20000,
@@ -147,15 +147,15 @@ class DatasetReader():
                     raise ValueError("Class name file incorrect format: %s" % line)
                 self.label_classname[parts[0]] = parts[1]
 
-    def _scale_gt_and_get_cell_ij(self, gt_box, image_size):
+    def _get_cell_ij(self, gt_box, image_size):
         """ Scale tensor[1:5] with @image_size and pack [cell_i, cell_j]
             at the end """
-        gt_box_0_1 = gt_box[0:1]
-        scaled_gt_box_1_5 = map(lambda x: x * image_size, gt_box[1:5])
-        gt_box_0_1.extend(scaled_gt_box_1_5)
-        cell_i = int(scaled_gt_box_1_5[0]/32)
-        cell_j = int(scaled_gt_box_1_5[1]/32)
-        return (gt_box_0_1, cell_i, cell_j)
+        assert image_size % 32 == 0, "image_size should be multiple of 32"
+        num_of_box = image_size / 32
+        percent_per_box = 1.0/num_of_box
+        cell_i = math.floor(gt_box[0]/percent_per_box)
+        cell_j = math.floor(gt_box[1]/percent_per_box)
+        return int(cell_i), int(cell_j)
 
     def _append_gt_box(self, gt_bnxs, box, image_size, cell_i, cell_j):
         feature_map_len = int(image_size/32)
@@ -187,7 +187,7 @@ class DatasetReader():
         return gt_bnxs
 
     def next_batch(self, batch_size=50, image_size=320, num_of_anchor_boxes=5,
-                   num_of_classes=1, num_of_gt_bnx_per_cell=10):
+                   num_of_classes=1, num_of_gt_bnx_per_cell=20):
         """ Return next batch of images.
 
           Args:
@@ -252,14 +252,10 @@ class DatasetReader():
                         ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
                            str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
 
-
-                # box = [label, x, y, w, h]
-                # cell_i, cell_j = self._get_cell_ij(box, image_size)
-                (box, cell_i, cell_j) = self._scale_gt_and_get_cell_ij(
-                                            [label, x, y, w, h],
-                                            image_size
-                                          )
+                box = [label, x, y, w, h]
+                cell_i, cell_j = self._get_cell_ij(box, image_size)
                 gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
+                assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"
 
             gt_bnxs = self._pack_and_flatten_gt_box(gt_bnxs, image_size,
                                                     num_of_gt_bnx_per_cell)
@@ -339,7 +335,7 @@ class YOLOLoss():
         # TODO
         num_of_anchor_boxes = 5
         num_of_classes = 1
-        num_of_gt_bnx_per_cell = 10
+        num_of_gt_bnx_per_cell = 20
 
         l = gt_boxes[idx][0]
         x = gt_boxes[idx][1]
@@ -377,7 +373,7 @@ class YOLOLoss():
         # TODO
         num_of_anchor_boxes = 5
         num_of_classes = 1
-        num_of_gt_bnx_per_cell = 10
+        num_of_gt_bnx_per_cell = 20
 
         box = boxes[idx]
 
@@ -548,74 +544,6 @@ def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1,
                         [1, 1],
                         scope="Final_output")
 
-    # We define these two function as inner function because we want to use
-    # variables `num_of_anchor_boxes` and `num_of_classes` as python variable
-    # other than tensor. See TENSOR-PYTHON below
-    def _scale_output_box_single(anchor_box_idx, obox, center_x, center_y, image_size):
-        # shape of obox [30]
-        box_item_num = 5 + num_of_classes
-        single_box = obox[anchor_box_idx*box_item_num : (anchor_box_idx+1)*box_item_num]
-        x = center_x + tf.sigmoid(single_box[0])*32
-        y = center_y + tf.sigmoid(single_box[1])*32
-        w = image_size * tf.sigmoid(single_box[2])
-        h = image_size * tf.sigmoid(single_box[3])
-        p_part = tf.stack([x, y, w, h])
-        p = tf.concat([p_part, single_box[4:]], axis=0)
-        obox_ = tf.concat([obox[0:anchor_box_idx*box_item_num],
-                          p,
-                          obox[(anchor_box_idx+1)*box_item_num:]], axis=0),
-        # TENSOR-PYTHON
-        # If we don't reshape this, it would have a shape of (?,). But obox is
-        # passed in as something like (30,). Therefore if we don't reshape,
-        # it would violate the while_loop invariant. But to reshape to something
-        # like (30,), we need `num_of_anchor_boxes` and `num_of_classes` as python
-        # variables, not a tensor. This is the reason why these functions are
-        # defined as inner function. (Another opt would be to use tf.while_loop
-        # invariant)
-        obox_ = tf.reshape(obox_, [num_of_anchor_boxes * box_item_num])
-        return (anchor_box_idx+1,
-                obox_,
-                center_x,
-                center_y,
-                image_size)
-
-    def _scale_output_body(idx, network, batch_size, row_num):
-        image_size = tf.cast(row_num * 32, tf.float32)
-        idx = idx % batch_size
-        cell_i = idx / row_num
-        cell_j = idx % row_num
-        center_x = tf.cast(cell_i*32 + (cell_i+1)*32, tf.float32) / 2
-        center_y = tf.cast(cell_j*32 + (cell_j+1)*32, tf.float32) / 2
-        boxes = network[idx]
-
-        _0, boxes, _01, _02, _03 = \
-                tf.while_loop(lambda j, obox, _1, _2, _3: j < num_of_anchor_boxes,
-                              _scale_output_box_single,
-                              [tf.constant(0), boxes, center_x, center_y, image_size])
-
-        return (idx+1,
-                tf.concat([network[0:idx], tf.stack([boxes]), network[idx+1:]], axis=0),
-                batch_size,
-                row_num)
-    #-------------------------------
-
-    net = tf.Print(net, [net], "net...")
-    # scale the output here
-    #
-    # flatten the whole net and only keep the last dimension.
-#    net_shape = tf.shape(net)
-#    batch_size = net_shape[0]
-#    row_num = net_shape[1]
-#    net = tf.reshape(net, shape=[-1, num_of_anchor_boxes*(5+num_of_classes)])
-#    _0, net, _01, _02 = \
-#        tf.while_loop(
-#            lambda i, network, _1, _2: i < batch_size*row_num*row_num,
-#            _scale_output_body,
-#            [tf.constant(0), net, batch_size, row_num]
-#        )
-#    net = tf.reshape(net, shape=net_shape)
-    net = tf.Print(net, [net], "net again...")
-
     return net, vars_to_restore
 
 def train(training_file_list, class_name_file, batch_size, num_of_classes,
@@ -703,7 +631,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         sys.stdout.write("Running train_step[%d]..." % idx)
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        loss_val = sess.run([loss], feed_dict={_x:batch_xs, _y_gt:batch_ys})
+        _, loss_val = sess.run([train_step, loss],
+                               feed_dict={_x:batch_xs, _y_gt:batch_ys})
         # merged_summary_trained, _2, loss_val = sess.run(
                             # [merged_summary, train_step, loss],
                             # feed_dict={_x: batch_xs, _y_gt: batch_ys},
