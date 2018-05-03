@@ -52,7 +52,7 @@ trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
 tf.app.flags.DEFINE_boolean("is_training", True, "To train or not to train.")
 
-tf.app.flags.DEFINE_boolean("freeze_backbone", True,
+tf.app.flags.DEFINE_boolean("freeze_backbone", False,
         "Freeze the backbone network or not")
 
 tf.app.flags.DEFINE_string("check_point_file", "./inception_v1.ckpt",
@@ -100,7 +100,7 @@ tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
 # It is pure pain to deal with tensor of variable length tensors (try and screw
 # up your life ;-). So we pack each cell with a fixed number of ground truth
 # bounding box.
-tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 10,
+tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 20,
         "Numer of ground truth bounding box.")
 
 tf.app.flags.DEFINE_integer("num_of_steps", 20000,
@@ -147,15 +147,15 @@ class DatasetReader():
                     raise ValueError("Class name file incorrect format: %s" % line)
                 self.label_classname[parts[0]] = parts[1]
 
-    def _scale_gt_and_get_cell_ij(self, gt_box, image_size):
+    def _get_cell_ij(self, gt_box, image_size):
         """ Scale tensor[1:5] with @image_size and pack [cell_i, cell_j]
             at the end """
-        gt_box_0_1 = gt_box[0:1]
-        scaled_gt_box_1_5 = map(lambda x: x * image_size, gt_box[1:5])
-        gt_box_0_1.extend(scaled_gt_box_1_5)
-        cell_i = int(scaled_gt_box_1_5[0]/32)
-        cell_j = int(scaled_gt_box_1_5[1]/32)
-        return (gt_box_0_1, cell_i, cell_j)
+        assert image_size % 32 == 0, "image_size should be multiple of 32"
+        num_of_box = image_size / 32
+        percent_per_box = 1.0/num_of_box
+        cell_i = math.floor(gt_box[0]/percent_per_box)
+        cell_j = math.floor(gt_box[1]/percent_per_box)
+        return int(cell_i), int(cell_j)
 
     def _append_gt_box(self, gt_bnxs, box, image_size, cell_i, cell_j):
         feature_map_len = int(image_size/32)
@@ -187,7 +187,7 @@ class DatasetReader():
         return gt_bnxs
 
     def next_batch(self, batch_size=50, image_size=320, num_of_anchor_boxes=5,
-                   num_of_classes=1, num_of_gt_bnx_per_cell=10):
+                   num_of_classes=1, num_of_gt_bnx_per_cell=20):
         """ Return next batch of images.
 
           Args:
@@ -252,14 +252,10 @@ class DatasetReader():
                         ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
                            str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
 
-
-                # box = [label, x, y, w, h]
-                # cell_i, cell_j = self._get_cell_ij(box, image_size)
-                (box, cell_i, cell_j) = self._scale_gt_and_get_cell_ij(
-                                            [label, x, y, w, h],
-                                            image_size
-                                          )
+                box = [label, x, y, w, h]
+                cell_i, cell_j = self._get_cell_ij(box, image_size)
                 gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
+                assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"
 
             gt_bnxs = self._pack_and_flatten_gt_box(gt_bnxs, image_size,
                                                     num_of_gt_bnx_per_cell)
@@ -294,141 +290,185 @@ class YOLOLoss():
         # return 1 / (1 + math.exp(-x))
 
     @staticmethod
-    def _intersec_len(x1, w1, x2, w2):
-        """ Calculate intersection len of two lines. """
-        # if x1 < x2:
-        #     if x2 >= x1 + w1/2:
-        #         return 0
-        #     return x1 + w1/2 - x2
-        # elif x1 > x2:
-        #     if x1 >= x2 + w2/2:
-        #         return 0
-        #     return x2 + w2/2 - x1
-        # else:
-        #     return min(w1, w2)
-        result = \
-          tf.cond(x1 < x2, # if x1 < x2
-                  lambda: tf.cond(x2 >= x1 + w1/2,
-                                  lambda: 0.0,
-                                  lambda: x1 + w1/2 - x2, name="_intersec_len_cond_2"),
-                  lambda: tf.cond(x1 > x2, # elif x1 > x2
-                                  lambda: tf.cond(x1 >= x2 + w2/2,
-                                                  lambda: 0.0,
-                                                  lambda: x2 + w2/2 - x1, name="_intersec_len_cond_4"),
-                                  # else
-                                  lambda: tf.minimum(w1, w2), name="_intersec_len_cond_3"), name="_intersec_len_cond_1")
-        return result
+    def bbox_iou_corner_xy(bboxes1, bboxes2):
+        """
+        Args:
+            bboxes1: shape (total_bboxes1, 4)
+                with x1, y1, x2, y2 point order.
+            bboxes2: shape (total_bboxes2, 4)
+                with x1, y1, x2, y2 point order.
+
+            p1 *-----
+               |     |
+               |_____* p2
+
+        Returns:
+            Tensor with shape (total_bboxes1, total_bboxes2)
+            with the IoU (intersection over union) of bboxes1[i] and bboxes2[j]
+            in [i, j].
+        """
+
+        x11, y11, x12, y12 = tf.split(bboxes1, 4, axis=1)
+        x21, y21, x22, y22 = tf.split(bboxes2, 4, axis=1)
+
+        xI1 = tf.maximum(x11, tf.transpose(x21))
+        yI1 = tf.maximum(y11, tf.transpose(y21))
+
+        xI2 = tf.minimum(x12, tf.transpose(x22))
+        yI2 = tf.minimum(y12, tf.transpose(y22))
+
+        inter_area = tf.maximum((xI2 - xI1 + 1), 0) * tf.maximum((yI2 - yI1 + 1), 0)
+
+        bboxes1_area = (x12 - x11 + 1) * (y12 - y11 + 1)
+        bboxes2_area = (x22 - x21 + 1) * (y22 - y21 + 1)
+
+        union = (bboxes1_area + tf.transpose(bboxes2_area)) - inter_area
+
+        return inter_area / union
 
     @staticmethod
-    def _cal_iou_real_gt(box1, box2):
-        xlen = YOLOLoss._intersec_len(box1[0], box1[2], box2[0], box2[2])
-        ylen = YOLOLoss._intersec_len(box1[1], box1[3], box2[1], box2[3])
-        return xlen * ylen
+    def bbox_iou_center_xy(bboxes1, bboxes2):
+        """ Same as `bbox_overlap_iou_v1', except that we have
+            center_x, center_y, w, h instead of x1, y1, x2, y2 """
+
+        x11, y11, w11, h11 = tf.split(bboxes1, 4, axis=1)
+        x21, y21, w21, h21 = tf.split(bboxes2, 4, axis=1)
+
+        xI1 = tf.maximum(x11, tf.transpose(x21))
+        xI2 = tf.minimum(x11, tf.transpose(x21))
+
+        yI1 = tf.maximum(y11, tf.transpose(y21))
+        yI2 = tf.minimum(y11, tf.transpose(y21))
+
+        wI = w11/2.0 + tf.transpose(w21/2.0)
+        hI = h11/2.0 + tf.transpose(h21/2.0)
+
+        inter_area = tf.maximum(wI - (xI1 - xI2 + 1), 0) \
+                      * tf.maximum(hI - (yI1 - yI2 + 1), 0)
+
+        bboxes1_area = w11 * h11
+        bboxes2_area = w21 * h21
+
+        union = (bboxes1_area + tf.transpose(bboxes2_area)) - inter_area
+
+        # some invalid boxes should have iou of 0 instead of NaN
+        # If inter_area is 0, then this result will be 0; if inter_area is
+        # not 0, then union is not too, therefore adding a epsilon is OK.
+        return inter_area / (union+0.0001)
 
     @staticmethod
-    def _cal_iou(out, gt):
-        """ Calculate out ^ gt. If gt all == 0, then it is a fake one, -1 """
-        result = \
-            tf.cond(tf.logical_and(gt[2] == 0, gt[3] == 0),
-                    lambda: 0.0,
-                    lambda: YOLOLoss._cal_iou_real_gt(out, gt), name="_cal_iou_cond")
-        return result
-
-    @staticmethod
-    def calculate_ground_truth_loss(idx, gt_boxes, op_boxes):
+    def concat_tranpose_broadcast(gt_boxes_padded, op_boxes):
+        """
+            tile
+            reshape
+            expand_dims
+        """
         # TODO
         num_of_anchor_boxes = 5
         num_of_classes = 1
-        num_of_gt_bnx_per_cell = 10
+        num_of_gt_bnx_per_cell = 20
 
-        l = gt_boxes[idx][0]
-        x = gt_boxes[idx][1]
-        y = gt_boxes[idx][2]
-        w = gt_boxes[idx][3]
-        h = gt_boxes[idx][4]
+        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
+        gt_tile = tf.tile(gt_boxes_padded, [1,num_of_anchor_boxes])
+        gt_reshape = \
+            tf.reshape(
+                gt_tile,
+                [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
+            )
+        gt_dim = tf.expand_dims(gt_reshape, 2)
 
-        ious_list = []
-        for i in range(num_of_anchor_boxes):
-            out = op_boxes[i]
-            iou = YOLOLoss._cal_iou(out[0:4], tf.stack([x,y,w,h]))
-            idx_tensor = tf.cast(tf.constant(i), tf.float32)
-            ious_list.append(tf.stack([iou, idx_tensor]))
-        ious_list_tensors = tf.stack(ious_list)
-        ious_tp_max = tf.reduce_max(ious_list_tensors, 0)
-        idx = tf.cast(ious_tp_max[1], tf.int32)
-        max_box = op_boxes[i]
+        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
+        op_reshape_1 = tf.reshape(op_boxes, [-1])
+        op_tile = tf.tile(op_boxes, [1, num_of_gt_bnx_per_cell])
+        op_reshape_2 = \
+            tf.reshape(
+                op_tile,
+                [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
+            )
+        op_dim = tf.expand_dims(op_reshape_2, 2)
 
-        match_gt_loss = (tf.pow(max_box[0]-x, 2)
-                        + tf.pow(max_box[1]-y, 2)
-                        # TODO gradient of tf.sqrt will probably be -NaN
-                        # + tf.pow(tf.sqrt(max_box[2])-tf.sqrt(w), 2)
-                        # + tf.pow(tf.sqrt(max_box[3])-tf.sqrt(h), 2)
-                        + tf.pow(max_box[2]-w, 2)
-                        + tf.pow(max_box[3]-h, 2)
-                        + tf.pow(max_box[4]-1, 2)
-                        + tf.pow(max_box[5+tf.cast(l, tf.int32)] - 0, 2))
-        # for i range(num_of_classes):
-            # if i == l: continue
-            # match_gt_loss += math.pow(max_iou_pred[5 + i] - 0, 2)
-            # pass
+        bundle = tf.concat([gt_dim, op_dim], -2)
+        return bundle
 
     @staticmethod
-    def calculate_loss_loop(idx, boxes, losses):
+    def bbox_iou_center_xy_pad_original(gt_boxes, op_boxes):
+        """
+            Args:
+             gt_boxes: [num_of_gt_bnx_per_cell, 5]
+             op_boxes: [num_of_anchor_boxes, 5+num_of_classes]
+
+            Return:
+              ious: [gt_bnx_left~, 3, 5+num_of_classes], with
+                        [:, 0, 0] the iou, and [:, 0, :] padded to 5+num_of_classes
+                        [:, 1, :] the ground_truth, padded to 5+num_of_classes
+                        [:, 2, :] the output
+        """
         # TODO
         num_of_anchor_boxes = 5
         num_of_classes = 1
-        num_of_gt_bnx_per_cell = 10
+        num_of_gt_bnx_per_cell = 20
 
-        box = boxes[idx]
+        gts = gt_boxes[:, 1:5]
+        ops = op_boxes[:, 0:4]
+
+        ious_0 = YOLOLoss.bbox_iou_center_xy(gts, ops)
+        # returned is something like, [[1,2,3], [4,5,6]]
+        # we want to make it [[[1],[2],[3]], [[4],[5],[6]]]
+        # and then pad it to [[[1,0..],[2,0..],[3,0..]], [[4,0..],[5,0..],[6,0..]]]
+        # and then expand dim to [[ [[1,0..]], [[2,0..]], [[3,0..]] ], ..] 
+        ious_1 = tf.expand_dims(ious_0, axis=2)
+        ious_paddings = [[0,0], [0,0], [0, num_of_classes+4]]
+        ious_2 = tf.pad(ious_1, ious_paddings)
+        ious = tf.expand_dims(ious_2, -2)
+        #pad ground truth
+        gt_paddings = [[0,0], [0, num_of_classes]]
+        gt_boxes_padded = tf.pad(gt_boxes, paddings=gt_paddings)
+        #concat with transpose (broadcasting)
+        op_gt_bundle = YOLOLoss.concat_tranpose_broadcast(
+                        gt_boxes_padded,
+                        op_boxes
+                    )
+        #concat the iou
+        bundle = tf.concat([op_gt_bundle, ious], -2)
+        return bundle
+
+    @staticmethod
+    def calculate_loss_loop(idx, boxes, total_loss):
+        # TODO
+        num_of_anchor_boxes = 5
+        num_of_classes = 1
+        num_of_gt_bnx_per_cell = 20
 
         split_num = num_of_anchor_boxes*(5+num_of_classes)
-        op_boxes = box[0:split_num]
-        op_boxes = tf.reshape(op_boxes, [num_of_anchor_boxes, 5+num_of_classes])
-        ground_truth = box[split_num:]
-        ground_truth = tf.reshape(ground_truth, [num_of_gt_bnx_per_cell, 5])
-        # ground_truth = tf.Print(ground_truth, [ground_truth], "ground_truth print: ")
+        op_boxes = tf.reshape(boxes[idx][0:split_num],
+                              [num_of_anchor_boxes, 5+num_of_classes])
+        gt_boxes = tf.reshape(boxes[idx][split_num:],
+                              [num_of_gt_bnx_per_cell, 5])
+        # There are many some fake ground truth (i.e., [0,0,0,0,0]) in gt_boxes, 
+        # but we can't naively remove it here. Instead, we use tf.ceil() below
+        # to calculate loss. That way, if it is a fake gt box with [0,0,0,0,0]
+        # tf.ceil() will return 0, doing no harm. Note that to make it "no harm"
+        # for those real gt box, a real gt box should contain coordinates < 1.
 
-        gt_losses = []
-        for i in range(num_of_gt_bnx_per_cell):
-            l = ground_truth[i][0]
-            x = ground_truth[i][1]
-            y = ground_truth[i][2]
-            w = ground_truth[i][3]
-            h = ground_truth[i][4]
-
-            ious_list = []
-            for j in range(num_of_anchor_boxes):
-                out = op_boxes[j]
-                iou = YOLOLoss._cal_iou(out[0:4], tf.stack([x,y,w,h]))
-                idx_tensor = tf.cast(tf.constant(j), tf.float32)
-                ious_list.append(tf.stack([iou, idx_tensor]))
-            ious_list_tensors = tf.stack(ious_list)
-            ious_tp_max = tf.reduce_max(ious_list_tensors, 0)
-            index = tf.cast(ious_tp_max[1], tf.int32)
-            max_box = op_boxes[index]
-            max_box = op_boxes[0]
-
-            match_gt_loss = (tf.pow(max_box[0]-x, 2)
-                            + tf.pow(max_box[1]-y, 2)
-                            # TODO gradient of tf.sqrt will probably be -NaN
-                            # + tf.pow(tf.sqrt(max_box[2])-tf.sqrt(w), 2)
-                            # + tf.pow(tf.sqrt(max_box[3])-tf.sqrt(h), 2)
-                            + tf.pow(max_box[2]-w, 2)
-                            + tf.pow(max_box[3]-h, 2)
-                            + tf.pow(max_box[4]-1, 2)
-                            + tf.pow(max_box[5+tf.cast(l, tf.int32)] - 0, 2))
-                            # TODO other classes penalized too
-                            # + tf.pow(max_box[5+tf.cast(l, tf.int32)] - 0, 2))
-            # for i range(num_of_classes):
-                # if i == l: continue
-                # match_gt_loss += math.pow(max_iou_pred[5 + i] - 0, 2)
-                # pass
-            gt_losses.append(match_gt_loss)
-
-
-        loss = tf.reduce_sum(tf.stack(gt_losses))
-        losses_ = tf.concat([losses[0:idx], tf.stack([tf.stack([loss])]), losses[idx+1:]], axis=0)
-        return (idx+1, boxes, losses_)
+        # get each gt's max iou and do some necessary padding
+        ious = YOLOLoss.bbox_iou_center_xy_pad_original(gt_boxes, op_boxes)
+        # ious of shape [gt_bnx_left~, 3, 5+num_of_classes], with
+        #   [:, 0, 0] the iou, and [:, 0, :] padded to 5+num_of_classes
+        #   [:, 1, :] the ground_truth, padded to 5+num_of_classes
+        #   [:, 2, :] the output
+        ious_max = tf.reduce_max(ious, axis=1, keepdims=False)
+        # calculate loss in a matrix favor
+        # TODO gradient of tf.sqrt will probably be -NaN, so we use pow for all
+        cooridniates_se = tf.pow(ious_max[:, 2, 0:4] - ious_max[:, 1, 1:5], 2)
+        cooridniates_se_real_gt = cooridniates_se * tf.ceil(ious_max[:, 1, 1:5])
+        coordinate_loss = tf.reduce_sum(cooridniates_se_real_gt)
+        objectness_se = tf.pow(ious_max[:, 2, 5] - 1, 2)
+        objectness_se_real_gt = objectness_se * tf.ceil(ious_max[:, 1, 3])
+        objectness_loss = tf.reduce_sum(objectness_se_real_gt)
+        # output_class_loss = 
+        all_loss = coordinate_loss + objectness_loss
+        total_loss = tf.concat([total_loss[0:idx], tf.stack([all_loss]), total_loss[idx+1:]], 0)
+        return (idx+1, boxes, total_loss)
 
     @staticmethod
     def calculate_loss(output, ground_truth, batch_size, num_of_anchor_boxes,
@@ -474,12 +514,13 @@ class YOLOLoss():
                     output_and_ground_truth,
                     [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
                 )
-        losses = tf.reduce_sum(tf.zeros_like(output_and_ground_truth), axis=-1, keepdims=True)
+        # losses = tf.reduce_sum(tf.zeros_like(output_and_ground_truth), axis=-1, keepdims=True)
+        total_loss = tf.ones([batch_size])
         _0, output_and_ground_truth, final_losses = \
                 tf.while_loop(
                         lambda idx, boxes, _1 : idx < batch_size*row_num*row_num,
                         YOLOLoss.calculate_loss_loop,
-                        [tf.constant(0), output_and_ground_truth, losses])
+                        [tf.constant(0), output_and_ground_truth, total_loss])
 
         loss = tf.reduce_mean(final_losses)
 
@@ -487,8 +528,8 @@ class YOLOLoss():
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
-def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1,
-           reuse=tf.AUTO_REUSE, freeze_backbone=True):
+def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
+           reuse=tf.AUTO_REUSE):
     """ This architecture of YOLO is not strictly the same as in those paper.
     We use inceptionv1 as a starting point, and then add necessary layers on
     top of it. Therefore, we name it `YOLO (version x)`.
@@ -548,80 +589,12 @@ def YOLOvx(images, num_of_anchor_boxes=5, num_of_classes=1,
                         [1, 1],
                         scope="Final_output")
 
-    # We define these two function as inner function because we want to use
-    # variables `num_of_anchor_boxes` and `num_of_classes` as python variable
-    # other than tensor. See TENSOR-PYTHON below
-    def _scale_output_box_single(anchor_box_idx, obox, center_x, center_y, image_size):
-        # shape of obox [30]
-        box_item_num = 5 + num_of_classes
-        single_box = obox[anchor_box_idx*box_item_num : (anchor_box_idx+1)*box_item_num]
-        x = center_x + tf.sigmoid(single_box[0])*32
-        y = center_y + tf.sigmoid(single_box[1])*32
-        w = image_size * tf.sigmoid(single_box[2])
-        h = image_size * tf.sigmoid(single_box[3])
-        p_part = tf.stack([x, y, w, h])
-        p = tf.concat([p_part, single_box[4:]], axis=0)
-        obox_ = tf.concat([obox[0:anchor_box_idx*box_item_num],
-                          p,
-                          obox[(anchor_box_idx+1)*box_item_num:]], axis=0),
-        # TENSOR-PYTHON
-        # If we don't reshape this, it would have a shape of (?,). But obox is
-        # passed in as something like (30,). Therefore if we don't reshape,
-        # it would violate the while_loop invariant. But to reshape to something
-        # like (30,), we need `num_of_anchor_boxes` and `num_of_classes` as python
-        # variables, not a tensor. This is the reason why these functions are
-        # defined as inner function. (Another opt would be to use tf.while_loop
-        # invariant)
-        obox_ = tf.reshape(obox_, [num_of_anchor_boxes * box_item_num])
-        return (anchor_box_idx+1,
-                obox_,
-                center_x,
-                center_y,
-                image_size)
-
-    def _scale_output_body(idx, network, batch_size, row_num):
-        image_size = tf.cast(row_num * 32, tf.float32)
-        idx = idx % batch_size
-        cell_i = idx / row_num
-        cell_j = idx % row_num
-        center_x = tf.cast(cell_i*32 + (cell_i+1)*32, tf.float32) / 2
-        center_y = tf.cast(cell_j*32 + (cell_j+1)*32, tf.float32) / 2
-        boxes = network[idx]
-
-        _0, boxes, _01, _02, _03 = \
-                tf.while_loop(lambda j, obox, _1, _2, _3: j < num_of_anchor_boxes,
-                              _scale_output_box_single,
-                              [tf.constant(0), boxes, center_x, center_y, image_size])
-
-        return (idx+1,
-                tf.concat([network[0:idx], tf.stack([boxes]), network[idx+1:]], axis=0),
-                batch_size,
-                row_num)
-    #-------------------------------
-
-    net = tf.Print(net, [net], "net...")
-    # scale the output here
-    #
-    # flatten the whole net and only keep the last dimension.
-#    net_shape = tf.shape(net)
-#    batch_size = net_shape[0]
-#    row_num = net_shape[1]
-#    net = tf.reshape(net, shape=[-1, num_of_anchor_boxes*(5+num_of_classes)])
-#    _0, net, _01, _02 = \
-#        tf.while_loop(
-#            lambda i, network, _1, _2: i < batch_size*row_num*row_num,
-#            _scale_output_body,
-#            [tf.constant(0), net, batch_size, row_num]
-#        )
-#    net = tf.reshape(net, shape=net_shape)
-    net = tf.Print(net, [net], "net again...")
-
     return net, vars_to_restore
 
 def train(training_file_list, class_name_file, batch_size, num_of_classes,
           num_of_image_scales, image_size_min, num_of_anchor_boxes,
           num_of_gt_bnx_per_cell, num_of_steps, check_point_file,
-          freeze_backbone=True):
+          freeze_backbone):
     """ Train the YOLOvx network.
 
       Args:
@@ -653,8 +626,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
     _y, _vars_to_restore = YOLOvx(_x,
                                   num_of_anchor_boxes=num_of_anchor_boxes,
                                   num_of_classes=num_of_classes,
-                                  reuse=False,
-                                  freeze_backbone=True)
+                                  freeze_backbone=freeze_backbone,
+                                  reuse=tf.AUTO_REUSE)
     _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
 
     loss = YOLOLoss.calculate_loss(output = _y,
@@ -687,7 +660,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
     restorer.restore(sess, check_point_file)
     tf.logging.info("Checkpoint restored!")
 
-    for idx in range(num_of_steps):
+    idx = 0
+    while idx != num_of_steps:
         # Change size every 100 steps.
         # `size' is the size of input image, not the final feature map size.
         image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
@@ -703,7 +677,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         sys.stdout.write("Running train_step[%d]..." % idx)
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        loss_val = sess.run([loss], feed_dict={_x:batch_xs, _y_gt:batch_ys})
+        _, loss_val = sess.run([train_step, loss],
+                               feed_dict={_x:batch_xs, _y_gt:batch_ys})
         # merged_summary_trained, _2, loss_val = sess.run(
                             # [merged_summary, train_step, loss],
                             # feed_dict={_x: batch_xs, _y_gt: batch_ys},
@@ -720,6 +695,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
 #            f.write(chrome_trace_format)
 
         print("Elapsed time: %s, LossVal: %s" % (str(elapsed_time), str(loss_val)))
+        idx += 1
 
 def main(_):
 
