@@ -311,9 +311,9 @@ class YOLOLoss():
     def bbox_iou_corner_xy(bboxes1, bboxes2):
         """
         Args:
-            bboxes1: shape (total_bboxes1, 4)
+            bboxes1: shape (batch_size, total_bboxes1, 4)
                 with x1, y1, x2, y2 point order.
-            bboxes2: shape (total_bboxes2, 4)
+            bboxes2: shape (batch_size, total_bboxes2, 4)
                 with x1, y1, x2, y2 point order.
 
             p1 *-----
@@ -321,64 +321,78 @@ class YOLOLoss():
                |_____* p2
 
         Returns:
-            Tensor with shape (total_bboxes1, total_bboxes2)
-            with the IoU (intersection over union) of bboxes1[i] and bboxes2[j]
-            in [i, j].
+            Tensor with shape (batch_size, total_bboxes1, total_bboxes2)
+            with the IoU (intersection over union) of bboxes1[:, i] and
+            bboxes2[:, j] in [:, i, j].
         """
 
-        x11, y11, x12, y12 = tf.split(bboxes1, 4, axis=1)
-        x21, y21, x22, y22 = tf.split(bboxes2, 4, axis=1)
+        x11, y11, x12, y12 = tf.split(bboxes1, 4, axis=2)
+        x21, y21, x22, y22 = tf.split(bboxes2, 4, axis=2)
 
-        xI1 = tf.maximum(x11, tf.transpose(x21))
-        xI2 = tf.minimum(x12, tf.transpose(x22))
+        xI1 = tf.maximum(x11, tf.transpose(x21, perm=[0,2,1]))
+        xI2 = tf.minimum(x12, tf.transpose(x22, perm=[0,2,1]))
 
-        yI1 = tf.minimum(y11, tf.transpose(y21))
-        yI2 = tf.maximum(y12, tf.transpose(y22))
+        yI1 = tf.minimum(y11, tf.transpose(y21, perm=[0,2,1]))
+        yI2 = tf.maximum(y12, tf.transpose(y22, perm=[0,2,1]))
 
         inter_area = tf.maximum((xI2 - xI1), 0) * tf.maximum((yI1 - yI2), 0)
 
         bboxes1_area = (x12 - x11) * (y11 - y12)
         bboxes2_area = (x22 - x21) * (y21 - y22)
 
-        union = (bboxes1_area + tf.transpose(bboxes2_area)) - inter_area
+        union = (bboxes1_area
+                 + tf.transpose(bboxes2_area, perm=[0,2,1])) - inter_area
+
+        return inter_area / (union+0.0001)
+
+    @staticmethod
+    def bbox_iou_center_xy(bboxes1, bboxes2):
+        """ same as `bbox_overlap_iou_v1', except that we have
+            center_x, center_y, w, h instead of x1, y1, x2, y2.
+
+          Args:
+            bboxes1: [d1, d21, 4].
+            bboxes2: [d1, d22, 4].
+
+          Return:
+             [d1, d21, d22, 1]
+        """
+
+        x11, y11, w11, h11 = tf.split(bboxes1, 4, axis=2)
+        x21, y21, w21, h21 = tf.split(bboxes2, 4, axis=2)
+
+        xi1 = tf.maximum(x11, tf.transpose(x21, perm=[0,2,1]))
+        xi2 = tf.minimum(x11, tf.transpose(x21, perm=[0,2,1]))
+
+        yi1 = tf.maximum(y11, tf.transpose(y21, perm=[0,2,1]))
+        yi2 = tf.minimum(y11, tf.transpose(y21, perm=[0,2,1]))
+
+        wi = w11/2.0 + tf.transpose(w21/2.0, perm=[0,2,1])
+        hi = h11/2.0 + tf.transpose(h21/2.0, perm=[0,2,1])
+
+        inter_area = tf.maximum(wi - (xi1 - xi2), 0) \
+                      * tf.maximum(hi - (yi1 - yi2), 0)
+
+        bboxes1_area = w11 * h11
+        bboxes2_area = w21 * h21
+
+        union = (bboxes1_area
+                 + tf.transpose(bboxes2_area, perm=[0,2,1])) - inter_area
 
         # some invalid boxes should have iou of 0 instead of NaN
         # If inter_area is 0, then this result will be 0; if inter_area is
         # not 0, then union is not too, therefore adding a epsilon is OK.
         return inter_area / (union+0.0001)
 
-    @staticmethod
-    def bbox_iou_center_xy(bboxes1, bboxes2):
-        """ same as `bbox_overlap_iou_v1', except that we have
-            center_x, center_y, w, h instead of x1, y1, x2, y2 """
-
-        x11, y11, w11, h11 = tf.split(bboxes1, 4, axis=1)
-        x21, y21, w21, h21 = tf.split(bboxes2, 4, axis=1)
-
-        xi1 = tf.maximum(x11, tf.transpose(x21))
-        xi2 = tf.minimum(x11, tf.transpose(x21))
-
-        yi1 = tf.maximum(y11, tf.transpose(y21))
-        yi2 = tf.minimum(y11, tf.transpose(y21))
-
-        wi = w11/2.0 + tf.transpose(w21/2.0)
-        hi = h11/2.0 + tf.transpose(h21/2.0)
-
-        inter_area = tf.maximum(wi - (xi1 - xi2 + 1), 0) \
-                      * tf.maximum(hi - (yi1 - yi2 + 1), 0)
-
-        bboxes1_area = w11 * h11
-        bboxes2_area = w21 * h21
-
-        union = (bboxes1_area + tf.transpose(bboxes2_area)) - inter_area
-
-        return inter_area / (union+0.0001)
-
     def concat_tranpose_broadcast(self, gt_boxes_padded, op_boxes):
-        """
-            tile
-            reshape
-            expand_dims
+        """ A concat operation with transpose semantic.
+
+            Args:
+              gt_boxes_padded: [batch_size, num_of_gt_bnx_per_cell, 5+num_of_classes].
+              op_boxes: [batch_size, num_of_anchor_boxes, 5+num_of_classes].
+
+            Return:
+              [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
         """
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
         num_of_anchor_boxes = self.num_of_anchor_boxes
@@ -390,51 +404,46 @@ class YOLOLoss():
                     )
         gt_reshape = tf.reshape(
                         gt_concat,
-                        [num_of_anchor_boxes * num_of_gt_bnx_per_cell, -1]
+                        [-1, num_of_anchor_boxes * num_of_gt_bnx_per_cell, 5+num_of_classes]
                     )
-        op_tile = tf.tile(op_boxes, [num_of_gt_bnx_per_cell, 1])
+        op_tile = tf.tile(op_boxes, [1, num_of_gt_bnx_per_cell, 1])
         gt_op = tf.concat([gt_reshape, op_tile], axis=-1)
         return tf.reshape(
               gt_op,
-              [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
+              [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
             )
 
     def bbox_iou_center_xy_pad_original(self, gt_boxes, op_boxes):
         """
           Args:
-           gt_boxes: [num_of_gt_bnx_per_cell, 5]
-           op_boxes: [num_of_anchor_boxes, 5+num_of_classes]
+           gt_boxes: [batch_size, num_of_gt_bnx_per_cell, 5]
+           op_boxes: [batch_size, num_of_anchor_boxes, 5+num_of_classes]
 
           Return:
             ious: [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
                   with
-                    [:, :, 0, 0] the iou, and [:, 0, :] padded to 5+num_of_classes
-                    [:, :, 1, :] the ground_truth, padded to 5+num_of_classes
-                    [:, :, 2, :] the output
+                    [:, :, :, 0, 0] the iou, and [:, :, :, 0, :] padded to 5+num_of_classes
+                    [:, :, :, 1, :] the ground_truth, padded to 5+num_of_classes
+                    [:, :, :, 2, :] the output
         """
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
-        ious_0 = YOLOLoss.bbox_iou_center_xy(gt_boxes[:, 1:5], op_boxes[:, 0:4])
-        # returned is something like, [[1,2,3], [4,5,6]]
-        # we want to make it [[[1],[2],[3]], [[4],[5],[6]]]
-        # and then pad it to [[[1,0..],[2,0..],[3,0..]], [[4,0..],[5,0..],[6,0..]]]
-        # and then expand dim to [[ [[1,0..]], [[2,0..]], [[3,0..]] ], ..] 
-        #
-        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1]
+        ious_0 = YOLOLoss.bbox_iou_center_xy(gt_boxes[:, :, 1:5], op_boxes[:, :, 0:4])
+        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1]
         ious_1 = tf.expand_dims(ious_0, axis=-1)
-        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
-        ious_paddings = [[0,0], [0,0], [0, num_of_classes+4]]
+        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
+        ious_paddings = [[0,0], [0,0], [0,0], [0, num_of_classes+4]]
         ious_2 = tf.pad(ious_1, ious_paddings)
-        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
+        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
         ious = tf.expand_dims(ious_2, -2)
 
-        # [num_of_gt_bnx_per_cell, 5+num_of_classes]
-        gt_paddings = [[0,0], [0, num_of_classes]]
+        # [batch_size, num_of_gt_bnx_per_cell, 5+num_of_classes]
+        gt_paddings = [[0,0], [0,0], [0, num_of_classes]]
         gt_boxes_padded = tf.pad(gt_boxes, paddings=gt_paddings)
 
-        # [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
+        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
         op_gt_bundle = self.concat_tranpose_broadcast(
                         gt_boxes_padded,
                         op_boxes
@@ -442,17 +451,17 @@ class YOLOLoss():
         bundle = tf.concat([op_gt_bundle, ious], -2)
         return bundle
 
-    def calculate_loss_loop(self, idx, boxes, total_loss):
+    def calculate_loss_inner(self, op_and_gt_batch):
 
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
         split_num = num_of_anchor_boxes*(5+num_of_classes)
-        op_boxes = tf.reshape(boxes[idx][0:split_num],
-                              [num_of_anchor_boxes, 5+num_of_classes])
-        gt_boxes = tf.reshape(boxes[idx][split_num:],
-                              [num_of_gt_bnx_per_cell, 5])
+        op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
+                              [-1, num_of_anchor_boxes, 5+num_of_classes])
+        gt_boxes = tf.reshape(op_and_gt_batch[..., split_num:],
+                              [-1, num_of_gt_bnx_per_cell, 5])
         # There are many some fake ground truth (i.e., [0,0,0,0,0]) in gt_boxes, 
         # but we can't naively remove it here. Instead, we use tf.ceil() below
         # to calculate loss. That way, if it is a fake gt box with [0,0,0,0,0]
@@ -465,35 +474,38 @@ class YOLOLoss():
         # get each gt's max iou and do some necessary padding
         ious = self.bbox_iou_center_xy_pad_original(gt_boxes, op_boxes)
         # ious of shape
-        #   [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
+        #   [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
         # with
-        #   [:, :, 0, 0] the iou, and [:, 0, :] padded to 5+num_of_classes
-        #   [:, :, 1, :] the ground_truth, padded to 5+num_of_classes
-        #   [:, :, 2, :] the output
-        # We reduce along the 1 axis here, that is, find the max ious for
+        #   [:, :, :, 0, 0] the iou, and [:, :, :, 0, :] padded to 5+num_of_classes
+        #   [:, :, :, 1, :] the ground_truth, padded to 5+num_of_classes
+        #   [:, :, :, 2, :] the output
+        # We reduce along the 2 axis here, that is, find the max ious for
         # each ground truth box.
-        ious_max = tf.reduce_max(ious, axis=1, keepdims=False)
+        ious_max = tf.reduce_max(ious, axis=2, keepdims=False)
         # calculate loss in a matrix favor
         # TODO gradient of tf.sqrt will probably be -NaN, so we use pow for all
-        cooridniates_se = tf.pow(ious_max[:, 2, 0:4] - ious_max[:, 1, 1:5], 2)
-        cooridniates_se_real_gt = cooridniates_se * tf.ceil(ious_max[:, 1, 1:5])
+        cooridniates_se = tf.pow(ious_max[:, :, 2, 0:4] - ious_max[:, :, 1, 1:5], 2)
+        cooridniates_se_real_gt = cooridniates_se * tf.ceil(ious_max[:, :, 1, 1:5])
         coordinate_loss = tf.reduce_sum(cooridniates_se_real_gt)
+        tf.summary.histogram("coordinate_loss", coordinate_loss)
 
-        objectness_se = tf.pow(ious_max[:, 2, 4] - 1, 2)
+        objectness_se = tf.pow(ious_max[:, :, 2, 4] - 1, 2)
         # if a bounding box is fake box, then there must be 0 in w or h
-        objectness_se_real_gt = objectness_se * tf.ceil(ious_max[:, 1, 2])
+        objectness_se_real_gt = objectness_se * tf.ceil(ious_max[:, :, 1, 2])
         objectness_loss = tf.reduce_sum(objectness_se_real_gt)
+        tf.summary.histogram("objectness_loss", objectness_loss)
 
         #TODO now we have only one class so we are hard-code that the class
         # is at position 0
-        classness_se = tf.pow(ious_max[:, 2, 0] - 0, 2)
-        classness_se_real_gt = classness_se * tf.ceil(ious_max[:, 1, 2])
+        classness_se = tf.pow(ious_max[:, :, 2, 0] - 0, 2)
+        classness_se_real_gt = classness_se * tf.ceil(ious_max[:, :, 1, 2])
         classness_loss = tf.reduce_sum(classness_se_real_gt)
+        tf.summary.histogram("classness_loss", classness_loss)
 
         all_loss = coordinate_loss + objectness_loss + classness_loss
+        tf.summary.histogram("all_loss", all_loss)
 
-        total_loss = tf.concat([total_loss[0:idx], tf.stack([all_loss]), total_loss[idx+1:]], 0)
-        return (idx+1, boxes, total_loss)
+        return all_loss
 
     def calculate_loss(self, output, ground_truth):
         """ Calculate loss using the loss from yolov1 + yolov2.
@@ -536,18 +548,7 @@ class YOLOLoss():
                     output_and_ground_truth,
                     [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
                 )
-        # losses = tf.reduce_sum(tf.zeros_like(output_and_ground_truth), axis=-1, keepdims=True)
-        total_loss = tf.ones([batch_size])
-        _0, output_and_ground_truth, final_losses = \
-                tf.while_loop(
-                        lambda idx, boxes, _1 : idx < batch_size*row_num*row_num,
-                        self.calculate_loss_loop,
-                        [tf.constant(0), output_and_ground_truth, total_loss])
-
-        tf.summary.histogram("loss_batch", final_losses)
-
-        loss = tf.reduce_mean(final_losses)
-
+        loss = self.calculate_loss_inner(output_and_ground_truth)
         return loss
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
@@ -715,7 +716,8 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
     global_step = tf.Variable(0, name='self_global_step', trainable=False)
-    train_step = tf.train.AdamOptimizer(1e-6).minimize(loss, global_step=global_step)
+    all_vars.append(global_step)
+    train_step = tf.train.AdamOptimizer(1e-4).minimize(loss, global_step=global_step)
 
     validation_images = validation(output=_y, images=_x,
                                    num_of_anchor_boxes=num_of_anchor_boxes,
@@ -731,6 +733,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
 
     # run_option = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
     # run_metadata = tf.RunMetadata()
+    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
                                             log_device_placement=False))
 
@@ -771,17 +774,17 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         train_summary, loss_val,_1,_2 = sess.run(
                         [merged_summary, loss, train_step, validation_images],
                         feed_dict={_x: batch_xs, _y_gt: batch_ys},
-                        # options=run_option,
+                        options=run_option,
                         # run_metadata=run_metadata,
                         )
         train_writer.add_summary(train_summary, idx)
         elapsed_time = datetime.datetime.now() - start_time
         sys.stdout.write("Elapsed time: {}, LossVal: {:10.10f} | ".format(elapsed_time, loss_val))
 
-        print("Validating these batch....")
+        print("Validating this batch....")
 
         if idx % 500  == 0:
-            ckpt_name = os.path.join(train_ckpt_dir, "model-%d.ckpt" % idx)
+            ckpt_name = os.path.join(train_ckpt_dir, "model.ckpt")
             if not os.path.exists(train_ckpt_dir):
                 os.makedirs(train_ckpt_dir)
             elif not os.path.isdir(train_ckpt_dir):
