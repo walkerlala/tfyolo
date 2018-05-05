@@ -8,7 +8,7 @@ YOLO implementation in Tensorflow.
 """
 How to restore variables from the inception v1 checkpoint:
 
-  import tensorflow as tf
+  # import tensorflow as tf
   from nets.inception_v1 import inception_v1
   from nets.inception_utils import inception_arg_scope
   slim = tf.contrib.slim
@@ -65,6 +65,8 @@ tf.app.flags.DEFINE_boolean("restore_all_variables", False,
 
 tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolo_train_dir",
         "Path to save checkpoints")
+tf.app.flags.DEFINE_string("train_log_dir", "/disk1/yolotraining/",
+        "Path to save tfevent (for tensorboard)")
 
 tf.app.flags.DEFINE_integer("batch_size", 50, "Batch size.")
 
@@ -261,6 +263,10 @@ class DatasetReader():
                 assert x<=1 and y<=1 and w<=1 and h<=1, \
                         ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
                            str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
+                assert w>0 and h > 0, \
+                        ("w&h must > 0. w&h: %s, y_path:%s" % (str([w,h]), y_path))
+                if x==0 or y==0:
+                    print("WARNING: x|y == 0, x&y: %s, y_path:%s" % (str[x, y], y_path))
 
                 box = [label, x, y, w, h]
                 cell_i, cell_j = self._get_cell_ij(box, image_size)
@@ -388,24 +394,22 @@ class YOLOLoss():
         """ A concat operation with transpose semantic.
 
             Args:
-              gt_boxes_padded: [batch_size, num_of_gt_bnx_per_cell, 5+num_of_classes].
-              op_boxes: [batch_size, num_of_anchor_boxes, 5+num_of_classes].
+              gt_boxes_padded: [-1, num_of_gt_bnx_per_cell, 5+num_of_classes].
+              op_boxes: [-1, num_of_anchor_boxes, 5+num_of_classes].
 
             Return:
-              [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
+              [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
         """
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
 
-        gt_concat = tf.concat(
-                      [gt_boxes_padded for i in range(num_of_anchor_boxes)],
-                      axis=-1
-                    )
+        gt_tile = tf.tile(gt_boxes_padded, [1,1,num_of_anchor_boxes])
         gt_reshape = tf.reshape(
-                        gt_concat,
+                        gt_tile,
                         [-1, num_of_anchor_boxes * num_of_gt_bnx_per_cell, 5+num_of_classes]
                     )
+
         op_tile = tf.tile(op_boxes, [1, num_of_gt_bnx_per_cell, 1])
         gt_op = tf.concat([gt_reshape, op_tile], axis=-1)
         return tf.reshape(
@@ -416,8 +420,8 @@ class YOLOLoss():
     def bbox_iou_center_xy_pad_original(self, gt_boxes, op_boxes):
         """
           Args:
-           gt_boxes: [batch_size, num_of_gt_bnx_per_cell, 5]
-           op_boxes: [batch_size, num_of_anchor_boxes, 5+num_of_classes]
+           gt_boxes: [-1, num_of_gt_bnx_per_cell, 5]
+           op_boxes: [-1, num_of_anchor_boxes, 5+num_of_classes]
 
           Return:
             ious: [num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
@@ -431,24 +435,24 @@ class YOLOLoss():
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
         ious_0 = YOLOLoss.bbox_iou_center_xy(gt_boxes[:, :, 1:5], op_boxes[:, :, 0:4])
-        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1]
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1]
         ious_1 = tf.expand_dims(ious_0, axis=-1)
-        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
         ious_paddings = [[0,0], [0,0], [0,0], [0, num_of_classes+4]]
         ious_2 = tf.pad(ious_1, ious_paddings)
-        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
         ious = tf.expand_dims(ious_2, -2)
 
-        # [batch_size, num_of_gt_bnx_per_cell, 5+num_of_classes]
+        # [-1, num_of_gt_bnx_per_cell, 5+num_of_classes]
         gt_paddings = [[0,0], [0,0], [0, num_of_classes]]
         gt_boxes_padded = tf.pad(gt_boxes, paddings=gt_paddings)
 
-        # [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
         op_gt_bundle = self.concat_tranpose_broadcast(
                         gt_boxes_padded,
                         op_boxes
                     )
-        bundle = tf.concat([op_gt_bundle, ious], -2)
+        bundle = tf.concat([ious, op_gt_bundle], -2)
         return bundle
 
     def calculate_loss_inner(self, op_and_gt_batch):
@@ -474,7 +478,7 @@ class YOLOLoss():
         # get each gt's max iou and do some necessary padding
         ious = self.bbox_iou_center_xy_pad_original(gt_boxes, op_boxes)
         # ious of shape
-        #   [batch_size, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
+        #   [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
         # with
         #   [:, :, :, 0, 0] the iou, and [:, :, :, 0, :] padded to 5+num_of_classes
         #   [:, :, :, 1, :] the ground_truth, padded to 5+num_of_classes
@@ -482,28 +486,26 @@ class YOLOLoss():
         # We reduce along the 2 axis here, that is, find the max ious for
         # each ground truth box.
         ious_max = tf.reduce_max(ious, axis=2, keepdims=False)
-        # calculate loss in a matrix favor
+
         # TODO gradient of tf.sqrt will probably be -NaN, so we use pow for all
         cooridniates_se = tf.pow(ious_max[:, :, 2, 0:4] - ious_max[:, :, 1, 1:5], 2)
-        cooridniates_se_real_gt = cooridniates_se * tf.ceil(ious_max[:, :, 1, 1:5])
+        cooridniates_se_ceil = tf.ceil(ious_max[:, :, 1, 1:5])
+        cooridniates_se_real_gt = cooridniates_se * cooridniates_se_ceil
         coordinate_loss = tf.reduce_sum(cooridniates_se_real_gt)
-        tf.summary.histogram("coordinate_loss", coordinate_loss)
 
         objectness_se = tf.pow(ious_max[:, :, 2, 4] - 1, 2)
-        # if a bounding box is fake box, then there must be 0 in w or h
-        objectness_se_real_gt = objectness_se * tf.ceil(ious_max[:, :, 1, 2])
+        objectness_se_ceil = tf.ceil(ious_max[:, :, 1, 2])
+        objectness_se_real_gt = objectness_se * objectness_se_ceil
         objectness_loss = tf.reduce_sum(objectness_se_real_gt)
-        tf.summary.histogram("objectness_loss", objectness_loss)
 
         #TODO now we have only one class so we are hard-code that the class
         # is at position 0
-        classness_se = tf.pow(ious_max[:, :, 2, 0] - 0, 2)
-        classness_se_real_gt = classness_se * tf.ceil(ious_max[:, :, 1, 2])
+        classness_se = tf.pow(ious_max[:, :, 2, 0] - 1, 2)
+        classness_se_ceil = tf.ceil(ious_max[:, :, 1, 2])
+        classness_se_real_gt = classness_se * classness_se_ceil
         classness_loss = tf.reduce_sum(classness_se_real_gt)
-        tf.summary.histogram("classness_loss", classness_loss)
 
         all_loss = coordinate_loss + objectness_loss + classness_loss
-        tf.summary.histogram("all_loss", all_loss)
 
         return all_loss
 
@@ -548,7 +550,9 @@ class YOLOLoss():
                     output_and_ground_truth,
                     [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
                 )
-        loss = self.calculate_loss_inner(output_and_ground_truth)
+
+        with tf.variable_scope("calculate_loss_inner_scope"):
+            loss = self.calculate_loss_inner(output_and_ground_truth)
         return loss
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
@@ -617,6 +621,12 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
                         [1, 1],
                         scope="Final_output")
 
+    tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
+    tf.summary.histogram("all_bias", tf.contrib.layers.summarize_collection(tf.GraphKeys.BIASES))
+    tf.summary.histogram("all_activations", tf.contrib.layers.summarize_collection(tf.GraphKeys.ACTIVATIONS))
+    # tf.summary.histogram("all_variables", tf.contrib.layers.summarize_collection(tf.GraphKeys.GLOBAL_VARIABLES))
+    tf.summary.histogram("all_global_step", tf.contrib.layers.summarize_collection(tf.GraphKeys.GLOBAL_STEP))
+
     # TODO now output is relative to the whole image
     return net, vars_to_restore
 
@@ -635,49 +645,126 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
 
     """
 
-    image_shape = tf.shape(images)
-    batch_size = image_shape[0]
-    output_shape = tf.shape(output)
-    output_row_num = output_shape[1]
+    with tf.variable_scope("validation_scope"):
+        image_shape = tf.shape(images)
+        batch_size = image_shape[0]
+        output_shape = tf.shape(output)
+        output_row_num = output_shape[1]
 
-    # scale output
-    # NOTE(TODO) these coordinates of these box are all relative to the whole image
-    output = tf.reshape(
-            output,
-            [batch_size, output_row_num * output_row_num * num_of_anchor_boxes, 5+num_of_classes]
-        )
-    output_bool = tf.equal(output, tf.constant([0.0]))
-    output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
-    # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
+        # scale output
+        # NOTE(TODO) these coordinates of these box are all relative to the whole image
+        output = tf.reshape(
+                output,
+                [batch_size, output_row_num * output_row_num * num_of_anchor_boxes, 5+num_of_classes]
+            )
+        # output_bool = tf.equal(output, tf.constant([0.0]))
+        # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
+        # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
 
-    # get P(class) = P(object) * P(class|object)
-    p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
-    output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
+        # get P(class) = P(object) * P(class|object)
+        p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
+        output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
 
-    # mask all the bounding boxes whose objectness value is not greater than
-    # threshold.
-    output_idx = output[..., 4]
-    mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
-    mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
-    masked_output = output * mask
-    # TODO now we just draw all the box, regardless its classes.
-    boxes_origin = masked_output[..., 0:4]
-    boxes = tf.concat([
-            boxes_origin[..., 1:2] - boxes_origin[..., 3:4]/2,
-            boxes_origin[..., 0:1] - boxes_origin[..., 2:3]/2,
-            boxes_origin[..., 1:2] + boxes_origin[..., 3:4]/2,
-            boxes_origin[..., 0:1] + boxes_origin[..., 2:3]/2],
-            axis=-1
-        )
-    # boxes = tf.Print(boxes, [boxes], "boxes", summarize=10000)
+        # mask all the bounding boxes whose objectness value is not greater than
+        # threshold.
+        output_idx = output[..., 4]
+        mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
+        mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
+        masked_output = output * mask
+        # TODO now we just draw all the box, regardless its classes.
+        boxes_origin = masked_output[..., 0:4]
+        boxes = tf.concat([
+                boxes_origin[..., 1:2] - boxes_origin[..., 3:4]/2,
+                boxes_origin[..., 0:1] - boxes_origin[..., 2:3]/2,
+                boxes_origin[..., 1:2] + boxes_origin[..., 3:4]/2,
+                boxes_origin[..., 0:1] + boxes_origin[..., 2:3]/2],
+                axis=-1
+            )
+        # boxes = tf.Print(boxes, [boxes], "boxes", summarize=10000)
 
-    result = tf.image.draw_bounding_boxes(images, boxes, name="boundingboxdraw")
-    return result
+        result = tf.image.draw_bounding_boxes(images, boxes, name="predict_on_images")
+        return result
+
+def validation_all_boxes(output, images, num_of_anchor_boxes, num_of_classes):
+    """
+        DUPLICATE FROM validation()
+    """
+
+    with tf.variable_scope("validation_all_boxes_scope"):
+        image_shape = tf.shape(images)
+        batch_size = image_shape[0]
+        output_shape = tf.shape(output)
+        output_row_num = output_shape[1]
+
+        # scale output
+        # NOTE(TODO) these coordinates of these box are all relative to the whole image
+        output = tf.reshape(
+                output,
+                [batch_size, output_row_num * output_row_num * num_of_anchor_boxes, 5+num_of_classes]
+            )
+        # output_bool = tf.equal(output, tf.constant([0.0]))
+        # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
+        # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
+
+        # get P(class) = P(object) * P(class|object)
+        p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
+        output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
+
+        # mask all the bounding boxes whose objectness value is not greater than
+        # threshold.
+        # output_idx = output[..., 4]
+        # mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
+        # mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
+        # masked_output = output * mask
+        # TODO now we just draw all the box, regardless its classes.
+        boxes_origin = output[..., 0:4]
+        boxes = tf.concat([
+                boxes_origin[..., 1:2] - boxes_origin[..., 3:4]/2,
+                boxes_origin[..., 0:1] - boxes_origin[..., 2:3]/2,
+                boxes_origin[..., 1:2] + boxes_origin[..., 3:4]/2,
+                boxes_origin[..., 0:1] + boxes_origin[..., 2:3]/2],
+                axis=-1
+            )
+        # boxes = tf.Print(boxes, [boxes], "boxes", summarize=10000)
+
+        result = tf.image.draw_bounding_boxes(images, boxes, name="predict_on_images_all_boxes")
+        return result
+
+def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell):
+    """Put ground truth boxes on images.
+
+      Args:
+        images: [batch_size, image_size, image_size, 3]
+        ground_truth: [batch_size, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
+
+      Return:
+          images with boxes on it.
+    """
+    with tf.variable_scope("build_image_scope"):
+        feature_map_len = tf.shape(images)[1]/32
+        ground_truth = tf.reshape(
+                            ground_truth,
+                            [-1, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
+                        )
+        x = ground_truth[..., 1:2]
+        y = ground_truth[..., 2:3]
+        w = ground_truth[..., 3:4]
+        h = ground_truth[..., 4:5]
+        boxes = tf.concat([
+                    y - h/2, # ymin
+                    x - w/2, # xmin
+                    y + h/2, # ymax
+                    x + w/2  # xmax
+                ],
+                axis=-1
+            )
+        result = tf.image.draw_bounding_boxes(images, boxes, name="ground_truth_on_images")
+        return result
 
 def train(training_file_list, class_name_file, batch_size, num_of_classes,
           num_of_image_scales, image_size_min, num_of_anchor_boxes,
           num_of_gt_bnx_per_cell, num_of_steps, checkpoint_file,
-          restore_all_variables, train_ckpt_dir, freeze_backbone,
+          restore_all_variables, train_ckpt_dir, train_log_dir, freeze_backbone,
           infer_threshold):
     """ Train the YOLOvx network.
 
@@ -705,7 +792,17 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
                                reuse=tf.AUTO_REUSE)
     _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
 
+    images_with_grouth_boxes = build_images_with_ground_truth(
+                                    _x,
+                                    _y_gt,
+                                    num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                                )
+    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes)
+
     all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    # Not all var in the backbone graph are trainable.
+    all_vars.extend(backbone_vars)
+    all_vars = list(set(all_vars))
 
     losscal = YOLOLoss(
                   batch_size=batch_size,
@@ -717,13 +814,18 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
     tf.summary.scalar("finalloss", loss)
     global_step = tf.Variable(0, name='self_global_step', trainable=False)
     all_vars.append(global_step)
-    train_step = tf.train.AdamOptimizer(1e-4).minimize(loss, global_step=global_step)
+    train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
 
     validation_images = validation(output=_y, images=_x,
                                    num_of_anchor_boxes=num_of_anchor_boxes,
                                    num_of_classes=num_of_classes,
                                    infer_threshold=infer_threshold)
     tf.summary.image("images_validation", validation_images, max_outputs=5)
+
+    validation_images_all_boxes = validation_all_boxes(output=_y, images=_x,
+                                   num_of_anchor_boxes=num_of_anchor_boxes,
+                                   num_of_classes=num_of_classes)
+    tf.summary.image("images_validation_all_boxes", validation_images_all_boxes)
     tf.logging.info("All network loss/train_step built! Yah!")
 
     # load images and labels
@@ -738,7 +840,11 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
                                             log_device_placement=False))
 
     merged_summary = tf.summary.merge_all()
-    train_writer = tf.summary.FileWriter("/disk1/yolotraining", sess.graph)
+    if not os.path.exists(train_log_dir):
+        os.makedirs(train_log_dir)
+    elif not os.path.isdir(train_log_dir):
+        print("{} already exists and is not a dir. Exit.".format(train_log_dir))
+    train_writer = tf.summary.FileWriter(train_log_dir, sess.graph)
 
     sess.run(initializer)
 
@@ -771,8 +877,10 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         sys.stdout.write("Running train_step[{}]...".format(idx))
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        train_summary, loss_val,_1,_2 = sess.run(
-                        [merged_summary, loss, train_step, validation_images],
+        train_summary, loss_val,_1,_2,_3,_4 = sess.run(
+                        [merged_summary, loss, train_step,
+                         validation_images, images_with_grouth_boxes,
+                         validation_images_all_boxes],
                         feed_dict={_x: batch_xs, _y_gt: batch_ys},
                         options=run_option,
                         # run_metadata=run_metadata,
@@ -784,7 +892,7 @@ def train(training_file_list, class_name_file, batch_size, num_of_classes,
         print("Validating this batch....")
 
         if idx % 500  == 0:
-            ckpt_name = os.path.join(train_ckpt_dir, "model.ckpt")
+            ckpt_name = os.path.join(train_ckpt_dir, "model-%d.ckpt" % idx)
             if not os.path.exists(train_ckpt_dir):
                 os.makedirs(train_ckpt_dir)
             elif not os.path.isdir(train_ckpt_dir):
@@ -811,6 +919,7 @@ def main(_):
               checkpoint_file    = FLAGS.checkpoint_file,
               restore_all_variables = FLAGS.restore_all_variables,
               train_ckpt_dir      = FLAGS.train_ckpt_dir,
+              train_log_dir       = FLAGS.train_log_dir,
               freeze_backbone     = FLAGS.freeze_backbone,
               infer_threshold     = FLAGS.infer_threshold)
     else:
