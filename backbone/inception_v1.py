@@ -20,7 +20,7 @@ from __future__ import print_function
 
 import tensorflow as tf
 
-from nets import inception_utils
+from backbone import inception_utils
 
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
@@ -253,7 +253,12 @@ def inception_v1_base(inputs,
         if final_endpoint == end_point: return net, end_points
     raise ValueError('Unknown final endpoint %s' % final_endpoint)
 
-
+# You can change the size of `inputs'. We have modified the arch of the original
+# inception v1 code, and now:
+#     with `inputs' as [None, 224, 224, 3], shape of `net' will be [?, 7, 7, 1024].
+#     with `inputs' as [None, 416, 416, 3], shape of `net' will be [?, 13, 13, 1024].
+# 
+# And we don't want global pooling at this level yet, so set global_pool=False.
 def inception_v1(inputs,
                  num_classes=1000,
                  is_training=True,
