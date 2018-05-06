@@ -9,6 +9,10 @@ import tensorflow as tf
 from utils.dataset import DatasetReader
 from networks.yolovx import YOLOvx
 from networks.yolovx import YOLOLoss
+from tensorflow.python.ops import control_flow_ops
+
+slim = tf.contrib.slim
+trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
 tf.app.flags.DEFINE_boolean("is_training", True, "To train or not to train.")
 
@@ -345,7 +349,23 @@ def train():
     tf.summary.scalar("finalloss", loss)
     global_step = tf.Variable(0, name='self_global_step', trainable=False)
     all_vars.append(global_step)
-    train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
+
+    starter_learning_rate = 1e-4
+    learning_rate = tf.train.exponential_decay(
+            learning_rate=starter_learning_rate,
+            global_step=global_step,
+            decay_steps=200,
+            decay_rate=0.9,
+            staircase=True
+        )
+    # train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
+    optimizer = tf.train.AdamOptimizer(learning_rate)
+    train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
+
+    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+    if update_ops:
+        updates = tf.group(*update_ops)
+        loss = control_flow_ops.with_dependencies([updates], loss)
 
     # scale x/y coordinates of output of the neural network to be relative of
     # the whole image.
@@ -366,7 +386,7 @@ def train():
                                     gt_scaled,
                                     num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
                                 )
-    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
+    # tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
     tf.logging.info("All network loss/train_step built! Yah!")
 

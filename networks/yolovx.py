@@ -52,7 +52,14 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
     inception_net = net
 
     with slim.arg_scope([slim.conv2d],
-                        weights_initializer=trunc_normal(0.01)):
+                        weights_initializer=trunc_normal(0.01),
+                        normalizer_fn=slim.batch_norm,
+                        normalizer_params={
+                            'is_training': True,
+                            'decay':0.95,
+                            'epsilon': 0.001,
+                            'updates_collections': tf.GraphKeys.UPDATE_OPS,
+                            'fused': None}):
         with slim.arg_scope([slim.conv2d, slim.max_pool2d],
                              stride=1, padding='SAME'):
             with tf.variable_scope("extra_inception_module_0", reuse=reuse):
@@ -309,7 +316,10 @@ class YOLOLoss():
         ious_max = tf.reduce_max(ious, axis=2, keepdims=False)
 
         # TODO gradient of tf.sqrt will probably be -NaN, so we use pow for all
-        cooridniates_se = tf.pow(ious_max[:, :, 2, 0:4] - ious_max[:, :, 1, 1:5], 2)
+        cooridniates_se_wh = tf.sqrt(
+                tf.pow(ious_max[:, :, 2, 2:4] - ious_max[:, :, 1, 3:5], 2)+0.0001)
+        cooridniates_se_xy = tf.pow(ious_max[:, :, 2, 0:2] - ious_max[:, :, 1, 1:3], 2)
+        cooridniates_se = tf.concat([cooridniates_se_xy, cooridniates_se_wh], axis=-1)
         cooridniates_se_ceil = tf.ceil(ious_max[:, :, 1, 1:5])
         cooridniates_se_real_gt = cooridniates_se * cooridniates_se_ceil
         coordinate_loss = tf.reduce_sum(cooridniates_se_real_gt)
