@@ -54,14 +54,14 @@ class DatasetReader():
                         )
                 self.label_classname[parts[0]] = parts[1]
 
-    def _get_cell_ij(self, gt_box, image_size):
+    def _get_cell_ij(self, x, y, image_size):
         """Get corresponding cell x/y coordinates of @gt_box (which cell it
         belongs in the final feature map) """
         assert image_size % 32 == 0, "image_size should be multiple of 32"
         num_of_box = image_size / 32
         percent_per_box = 1.0/num_of_box
-        cell_i = math.floor(gt_box[0]/percent_per_box)
-        cell_j = math.floor(gt_box[1]/percent_per_box)
+        cell_i = math.floor(x/percent_per_box)
+        cell_j = math.floor(y/percent_per_box)
         return int(cell_i), int(cell_j)
 
     def _append_gt_box(self, gt_bnxs, box, image_size, cell_i, cell_j):
@@ -93,8 +93,25 @@ class DatasetReader():
         gt_bnxs = np.array(gt_bnxs).reshape((feature_map_len, feature_map_len, 5*num_of_gt_bnx_per_cell))
         return gt_bnxs
 
+    def _get_outscale(self, image_size):
+        """
+        [image_size/32, image_size/32, 3]
+        """
+        assert image_size % 32 == 0, "image_size should be multiple of 32"
+        row_num = image_size / 32
+        outscale = []
+        for i in range(row_num):
+            outscale.append([])
+            for j in range(row_num):
+                outscale[i].append([])
+                outscale[i][j].append(i/float(row_num))
+                outscale[i][j].append(j/float(row_num))
+                outscale[i][j].append(row_num)
+        return outscale
+
     def next_batch(self, batch_size=50, image_size=320, num_of_anchor_boxes=5,
-                   num_of_gt_bnx_per_cell=20, normalize_image=True):
+                   num_of_gt_bnx_per_cell=20, normalize_image=True,
+                   shrink_coordinate_related_to_cell=True):
         """ Return next batch of images.
 
           Args:
@@ -104,14 +121,21 @@ class DatasetReader():
             num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
             num_of_gt_bnx_per_cell: See FLAGS.num_of_gt_bnx_per_cell.
             normalize_image: To or to not normalize the image (to [0, 1]).
+            shrink_coordinate_related_to_cell: To or not to scale the x/y
+                coordinates to be relative to their corresponding cell.
+                NOTE!! There are lots of code that assumes this to True, so
+                don't change that unless you know what you are doing here.
+                TODO
 
           Return:
             batch_xs: A batch of image, i.e., a numpy array in shape
                       [batch_size, image_size, image_size, 3]
             batch_ys: A batch of ground truth bounding box value, in shape
                       [batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell]
+            outscale: Scale information (of x/y coordinates) for this batch.
         """
         assert image_size % 32 == 0, "image_size should be multiple of 32"
+        cell_size = 32
         batch_xs_filename = []
         for _ in range(batch_size):
             batch_xs_filename.append(self.images_queue.get())
@@ -168,8 +192,15 @@ class DatasetReader():
                 if x==0 or y==0:
                     print("WARNING: x|y == 0, x&y: %s, y_path:%s" % (str[x, y], y_path))
 
+                cell_i, cell_j = self._get_cell_ij(x, y, image_size)
+                if shrink_coordinate_related_to_cell:
+                    x *= image_size
+                    x %= cell_size
+                    x /= cell_size
+                    y *= image_size
+                    y %= cell_size
+                    y /= cell_size
                 box = [label, x, y, w, h]
-                cell_i, cell_j = self._get_cell_ij(box, image_size)
                 gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
                 assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"
 
@@ -189,5 +220,7 @@ class DatasetReader():
                   % (str(batch_ys.shape),
                      str((batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell)))
 
-        return batch_xs, batch_ys
+        outscale = self._get_outscale(image_size)
+
+        return batch_xs, batch_ys, outscale
 

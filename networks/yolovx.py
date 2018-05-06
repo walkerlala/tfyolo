@@ -51,12 +51,10 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
     vars_to_restore = slim.get_variables_to_restore()
     inception_net = net
 
-    with slim.arg_scope([slim.conv2d, slim.fully_connected],
-                        weights_initializer=trunc_normal(0.01),
-                        activation_fn=tf.nn.sigmoid
-                       ):
+    with slim.arg_scope([slim.conv2d],
+                        weights_initializer=trunc_normal(0.01)):
         with slim.arg_scope([slim.conv2d, slim.max_pool2d],
-                            stride=1, padding='SAME'):
+                             stride=1, padding='SAME'):
             with tf.variable_scope("extra_inception_module_0", reuse=reuse):
                 with tf.variable_scope("Branch_0"):
                     branch_0 = slim.conv2d(net, 32, [1, 1], scope='Conv2d_0a_1x1')
@@ -79,12 +77,15 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
                 # of `net' such that we can "pool concat" them.
                 net = tf.concat(axis=3, values=[inception_net, net])
 
-
                 # Follow the number of output in YOLOv3
-                net = slim.conv2d(net,
-                        num_of_anchor_boxes * (5 + num_of_classes),
-                        [1, 1],
-                        scope="Final_output")
+                # Use sigmoid the constraint output to [0, 1]
+                with slim.arg_scope([slim.conv2d], activation_fn=tf.nn.sigmoid):
+                    net = slim.conv2d(
+                            net,
+                            num_of_anchor_boxes * (5 + num_of_classes),
+                            [1, 1],
+                            scope="Final_output"
+                        )
 
     # tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
     # tf.summary.histogram("all_bias", tf.contrib.layers.summarize_collection(tf.GraphKeys.BIASES))
@@ -92,7 +93,8 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
     # # tf.summary.histogram("all_variables", tf.contrib.layers.summarize_collection(tf.GraphKeys.GLOBAL_VARIABLES))
     # tf.summary.histogram("all_global_step", tf.contrib.layers.summarize_collection(tf.GraphKeys.GLOBAL_STEP))
 
-    # TODO now output is relative to the whole image
+    # NOTE all the values output in `net` are relative to the cell size, not the
+    # whole image
     return net, vars_to_restore
 
 class YOLOLoss():

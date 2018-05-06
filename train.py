@@ -77,40 +77,150 @@ FLAGS = tf.app.flags.FLAGS
 
 tf.logging.set_verbosity(tf.logging.DEBUG)
 
+def scale_output(output, outscale, num_of_anchor_boxes, num_of_classes):
+    """ Scale x/y coordinates to be relative to the whole image.
+
+        Args:
+          output: YOLOvx network output, shape
+            [None, None, None, num_of_anchor_boxes*(5+num_of_classes)]
+          outscale: [None, None, 3], the first dimension is against the
+            second dimension of @output, the second dimension is against
+            the third dimension of @output (that is, we do it across the
+            whole batch).
+
+        Return:
+            the scaled output.
+    """
+    # [None, None, 2]
+    outscale_add_part = outscale[..., 0:2]
+    # [None, None, 1]
+    outscale_div_part = outscale[..., 2:3]
+    outscale_div_part = tf.tile(outscale_div_part, [1,1,2])
+
+    outscale_add_shape = tf.shape(outscale_add_part)
+    outscale_add_pad = tf.zeros(
+               [outscale_add_shape[0], outscale_add_shape[1], 3+num_of_classes],
+               dtype=tf.float32
+            )
+    # [None, None, 5+num_of_classes]
+    outscale_add = tf.concat([outscale_add_part, outscale_add_pad], axis=-1)
+    # [None, None, 1, 5+num_of_classes]
+    outscale_add = tf.expand_dims(outscale_add, axis=-2)
+    # [None, None, num_of_anchor_boxes, 5+num_of_classes]
+    outscale_add = tf.tile(outscale_add, [1,1,num_of_anchor_boxes,1])
+
+    outscale_div_shape = tf.shape(outscale_div_part)
+    outscale_div_pad = tf.ones(
+               [outscale_div_shape[0], outscale_div_shape[1], 3+num_of_classes],
+               dtype=tf.float32
+            )
+    outscale_div = tf.concat([outscale_div_part, outscale_div_pad], axis=-1)
+    outscale_div = tf.expand_dims(outscale_div, axis=-2)
+    outscale_div = tf.tile(outscale_div, [1,1,num_of_anchor_boxes,1])
+
+    output_shape = tf.shape(output)
+    output = tf.reshape(
+                output,
+                [output_shape[0], output_shape[1], output_shape[2],
+                 num_of_anchor_boxes, 5+num_of_classes])
+
+    output = output / outscale_div + outscale_add
+
+    output = tf.reshape(output,
+                    [output_shape[0], output_shape[1], output_shape[2], -1])
+    return output
+
+def scale_ground_truth(ground_truth, outscale, num_of_gt_bnx_per_cell):
+    """Similar to scale_output(), except that it operates on ground_truth labels
+    instead of output labels"""
+
+    # [None, None, 2]
+    outscale_add_part = outscale[..., 0:2]
+    # [None, None, 1]
+    outscale_div_part = outscale[..., 2:3]
+    outscale_div_part = tf.tile(outscale_div_part, [1,1,2])
+
+    # the first element in a ground truth label is class-id, following with
+    # x,y,w,h coordinates.
+    outscale_add_shape = tf.shape(outscale_add_part)
+    outscale_add_pad_lhs = tf.zeros(
+               [outscale_add_shape[0], outscale_add_shape[1], 1],
+               dtype=tf.float32
+            )
+    outscale_add_pad_rhs = tf.zeros(
+               [outscale_add_shape[0], outscale_add_shape[1], 2],
+               dtype=tf.float32
+            )
+    # [None, None, 5]
+    outscale_add = tf.concat(
+            [outscale_add_pad_lhs, outscale_add_part, outscale_add_pad_rhs],
+            axis=-1
+            )
+    # [None, None, 1, 5]
+    outscale_add = tf.expand_dims(outscale_add, axis=-2)
+    # [None, None, num_of_gt_bnx_per_cell, 5]
+    outscale_add = tf.tile(outscale_add, [1,1,num_of_gt_bnx_per_cell,1])
+
+    outscale_div_shape = tf.shape(outscale_div_part)
+    outscale_div_pad_lhs = tf.ones(
+               [outscale_div_shape[0], outscale_div_shape[1], 1],
+               dtype=tf.float32
+            )
+    outscale_div_pad_rhs = tf.ones(
+               [outscale_div_shape[0], outscale_div_shape[1], 2],
+               dtype=tf.float32
+            )
+    outscale_div = tf.concat(
+            [outscale_div_pad_lhs, outscale_div_part, outscale_div_pad_rhs],
+            axis=-1
+            )
+    outscale_div = tf.expand_dims(outscale_div, axis=-2)
+    outscale_div = tf.tile(outscale_div, [1,1,num_of_gt_bnx_per_cell,1])
+
+    ground_truth_shape = tf.shape(ground_truth)
+    ground_truth = tf.reshape(
+            ground_truth,
+            [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2],
+             num_of_gt_bnx_per_cell, 5])
+
+    ground_truth = ground_truth / outscale_div + outscale_add
+    ground_truth = tf.reshape(ground_truth,
+            [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2], -1])
+    return ground_truth
+
 def validation(output, images, num_of_anchor_boxes, num_of_classes,
           infer_threshold=0.6):
     """
         Args:
          output: YOLOvx network output, shape
-                 [None, None, None, num_of_anchor_boxes * (5+num_of_classes)]
+            [None, None, None, num_of_anchor_boxes * (5+num_of_classes)]
+
+            Note, the x/y coordinates from the original neural network output are
+            relative to the the corresponding cell. Here we expect them to be
+            already scaled to relative to the whole image.
+
          images: input images, shape [None, None, None, 3]
          infer_threshold: See FLAGS.infer_threshold.
          num_of_anchor_boxes:
          num_of_classes:
 
         Return:
-
+         A copy of @images with bounding box on it.
     """
-
     with tf.variable_scope("validation_scope"):
         image_shape = tf.shape(images)
         batch_size = image_shape[0]
         output_shape = tf.shape(output)
         output_row_num = output_shape[1]
 
-        # scale output
-        # NOTE(TODO) these coordinates of these box are all relative to the whole image
-        output = tf.reshape(
-                output,
-                [batch_size, output_row_num * output_row_num * num_of_anchor_boxes, 5+num_of_classes]
-            )
+        output = tf.reshape(output, [-1, 5+num_of_classes])
         # output_bool = tf.equal(output, tf.constant([0.0]))
         # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
         # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
 
         # get P(class) = P(object) * P(class|object)
-        p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
-        output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
+        # p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
+        # output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
 
         # mask all the bounding boxes whose objectness value is not greater than
         # threshold.
@@ -119,62 +229,38 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
         mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
         masked_output = output * mask
         # TODO now we just draw all the box, regardless of its classes.
-        boxes_origin = masked_output[..., 0:4]
-        boxes = tf.concat([
-                boxes_origin[..., 1:2] - boxes_origin[..., 3:4]/2,
-                boxes_origin[..., 0:1] - boxes_origin[..., 2:3]/2,
-                boxes_origin[..., 1:2] + boxes_origin[..., 3:4]/2,
-                boxes_origin[..., 0:1] + boxes_origin[..., 2:3]/2],
+        boxes_x = masked_output[..., 0:1]
+        boxes_y = masked_output[..., 1:2]
+        boxes_w = masked_output[..., 2:3]
+        boxes_h = masked_output[..., 3:4]
+        output_rhs = masked_output[..., 4:]
+        output = tf.concat([
+                boxes_y - boxes_h/2, # ymin
+                boxes_x - boxes_w/2, # xmin
+                boxes_y + boxes_h/2, # ymax
+                boxes_x + boxes_w/2, # xmax
+                output_rhs],
                 axis=-1
             )
-        # boxes = tf.Print(boxes, [boxes], "boxes", summarize=10000)
 
-        result = tf.image.draw_bounding_boxes(images, boxes, name="predict_on_images")
-        return result
+        # non-max suppression
+        selected_indices = tf.image.non_max_suppression(
+                            output[...,0:4],
+                            output[..., 4],
+                            max_output_size=10000,
+                            iou_threshold=0.6
+                        )
+        # mask non-selected box
+        one_hot = tf.one_hot(selected_indices, tf.shape(output)[0], dtype=output.dtype)
+        mask = tf.reduce_sum(one_hot, axis=0)
+        output = output * mask[..., None]
 
-def validation_all_boxes(output, images, num_of_anchor_boxes, num_of_classes):
-    """
-        DUPLICATE FROM validation()
-    """
-
-    with tf.variable_scope("validation_all_boxes_scope"):
-        image_shape = tf.shape(images)
-        batch_size = image_shape[0]
-        output_shape = tf.shape(output)
-        output_row_num = output_shape[1]
-
-        # scale output
-        # NOTE(TODO) these coordinates of these box are all relative to the whole image
         output = tf.reshape(
                 output,
-                [batch_size, output_row_num * output_row_num * num_of_anchor_boxes, 5+num_of_classes]
-            )
-        # output_bool = tf.equal(output, tf.constant([0.0]))
-        # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
-        # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
-
-        # get P(class) = P(object) * P(class|object)
-        p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
-        output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
-
-        # mask all the bounding boxes whose objectness value is not greater than
-        # threshold.
-        # output_idx = output[..., 4]
-        # mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
-        # mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
-        # masked_output = output * mask
-        # TODO now we just draw all the box, regardless its classes.
-        boxes_origin = output[..., 0:4]
-        boxes = tf.concat([
-                boxes_origin[..., 1:2] - boxes_origin[..., 3:4]/2,
-                boxes_origin[..., 0:1] - boxes_origin[..., 2:3]/2,
-                boxes_origin[..., 1:2] + boxes_origin[..., 3:4]/2,
-                boxes_origin[..., 0:1] + boxes_origin[..., 2:3]/2],
-                axis=-1
-            )
-        # boxes = tf.Print(boxes, [boxes], "boxes", summarize=10000)
-
-        result = tf.image.draw_bounding_boxes(images, boxes, name="predict_on_images_all_boxes")
+                [batch_size,
+                    output_row_num * output_row_num * num_of_anchor_boxes,
+                        5+num_of_classes])
+        result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
         return result
 
 def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell):
@@ -244,15 +330,6 @@ def train():
                                reuse=tf.AUTO_REUSE)
     _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
 
-    # tf.summary.image("images_input", _x, max_outputs=3)
-
-    # images_with_grouth_boxes = build_images_with_ground_truth(
-    #                                 _x,
-    #                                 _y_gt,
-    #                                 num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
-    #                             )
-    # tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
-
     all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
     # Not all var in the backbone graph are trainable.
     all_vars.extend(backbone_vars)
@@ -268,13 +345,28 @@ def train():
     tf.summary.scalar("finalloss", loss)
     global_step = tf.Variable(0, name='self_global_step', trainable=False)
     all_vars.append(global_step)
-    train_step = tf.train.AdamOptimizer(1e-6).minimize(loss, global_step=global_step)
+    train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
 
-    validation_images = validation(output=_y, images=_x,
+    # scale x/y coordinates of output of the neural network to be relative of
+    # the whole image.
+    output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
+    y_scaled = scale_output(_y, output_scale_placeholder,
+                                 num_of_anchor_boxes=num_of_anchor_boxes,
+                                 num_of_classes=num_of_classes)
+    validation_images = validation(output=y_scaled, images=_x,
                                    num_of_anchor_boxes=num_of_anchor_boxes,
                                    num_of_classes=num_of_classes,
                                    infer_threshold=infer_threshold)
     tf.summary.image("images_validation", validation_images, max_outputs=3)
+
+    gt_scaled = scale_ground_truth(_y_gt, output_scale_placeholder,
+                                   num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell)
+    images_with_grouth_boxes = build_images_with_ground_truth(
+                                    _x,
+                                    gt_scaled,
+                                    num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                                )
+    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
     tf.logging.info("All network loss/train_step built! Yah!")
 
@@ -316,12 +408,12 @@ def train():
         if idx % 100 == 0 and idx:
             print("Switching to another image size: %d" % image_size)
 
-        batch_xs, batch_ys = reader.next_batch(
-                                batch_size=batch_size,
-                                image_size=image_size,
-                                num_of_anchor_boxes=num_of_anchor_boxes,
-                                num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
-                            )
+        batch_xs, batch_ys, outscale = reader.next_batch(
+                            batch_size=batch_size,
+                            image_size=image_size,
+                            num_of_anchor_boxes=num_of_anchor_boxes,
+                            num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                        )
 
         sys.stdout.write("Running train_step[{}]...".format(idx))
         sys.stdout.flush()
@@ -329,7 +421,10 @@ def train():
         train_summary, loss_val,_1,_2 = \
             sess.run(
                 [merged_summary, loss, train_step, validation_images],
-                feed_dict={_x: batch_xs, _y_gt: batch_ys},
+                feed_dict={
+                    _x: batch_xs,
+                    _y_gt: batch_ys,
+                    output_scale_placeholder: outscale},
                 options=run_option,
                 # run_metadata=run_metadata,
             )
