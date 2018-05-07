@@ -11,6 +11,7 @@ import cv2
 import math
 import numpy as np
 import random
+import pdb
 
 class DatasetReader():
     """ Reader to read images/labels """
@@ -184,11 +185,14 @@ class DatasetReader():
                 w = float(w) # width of the box
                 h = float(h) # height of the box
                 # Some label at COCO dataset has 1.000 as width/height
-                assert x<=1 and y<=1 and w<=1 and h<=1, \
-                        ("[x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
-                           str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
-                assert w>0 and h > 0, \
-                        ("w&h must > 0. w&h: %s, y_path:%s" % (str([w,h]), y_path))
+                if not (x<=1 and y<=1 and w<=1 and h<=1):
+                    print("WRONG DATA. [x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
+                          str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
+                    continue
+                if not (w>0 and h > 0):
+                    print("WRONG DATA. w&h must > 0. w&h: %s, y_path:%s" % (
+                          str([w,h]), y_path))
+                    continue
                 if x==0 or y==0:
                     print("WARNING: x|y == 0, x&y: %s, y_path:%s" % (str[x, y], y_path))
 

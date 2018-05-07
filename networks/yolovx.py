@@ -10,23 +10,59 @@ from __future__ import print_function
 
 import numpy as np
 import math
+import pdb
 import tensorflow as tf
 from backbone.inception_v1 import inception_v1
+from backbone.vgg import vgg_16
+from backbone.vgg import vgg_arg_scope
 from backbone.inception_utils import inception_arg_scope
 
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
+FLAGS = tf.app.flags.FLAGS
+
+def backbone_network(images, backbone_arch, reuse):
+
+    freeze_backbone = FLAGS.freeze_backbone
+
+    if backbone_arch == 'inception_v1':
+        with slim.arg_scope(inception_arg_scope()):
+            backbone_network, endpoints = inception_v1(
+                                            images,
+                                            num_classes=None,
+                                            is_training=not freeze_backbone,
+                                            global_pool=False,
+                                            reuse=reuse
+                                        )
+        vars_to_restore = slim.get_variables_to_restore()
+
+    else:
+        with slim.arg_scope(vgg_arg_scope()):
+            backbone_network, endpoints = vgg_16(
+                                           images,
+                                           num_classes=None,
+                                           is_training=not freeze_backbone,
+                                           global_pool=False,
+                                           fc_conv_padding='SAME',
+                                           spatial_squeeze=False,
+                                           reuse=reuse)
+        vars_to_restore = slim.get_variables_to_restore()
+        # vgg_16_vars_to_restore = list(set(vgg_16_vars_to_restore)-set(inceptioin_vars_to_restore))
+
+    return backbone_network, vars_to_restore
+
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
-def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
-           reuse=tf.AUTO_REUSE):
+def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
+           freeze_backbone, reuse=tf.AUTO_REUSE):
     """ This architecture of YOLO is not strictly the same as in those paper.
     We use inceptionv1 as a starting point, and then add necessary layers on
     top of it. Therefore, we name it `YOLO (version x)`.
 
     Args:
         images: Input images, of shape [None, None, None, 3].
+        backbone_arch:
         num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
         num_of_classes: see FLAGS.num_of_classes.
         reuse: Whether or not the network weights should be reused when
@@ -39,20 +75,11 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
             that should be restored from the checkpoint file.
     """
 
-    with slim.arg_scope(inception_arg_scope()):
-        net, endpoints = inception_v1(images, num_classes=None,
-                                      is_training=not freeze_backbone,
-                                      global_pool=False,
-                                      reuse=reuse)
-
-    # Get all inception v1 variables here, because the network arch will change
-    # later on. Note that not all vars in the inception v1 network are
-    # trainable.
-    vars_to_restore = slim.get_variables_to_restore()
-    inception_net = net
+    backbone, vars_to_restore = backbone_network(images, backbone_arch, reuse=reuse)
 
     with slim.arg_scope([slim.conv2d],
                         weights_initializer=trunc_normal(0.01),
+                        activation_fn=tf.nn.sigmoid,
                         normalizer_fn=slim.batch_norm,
                         normalizer_params={
                             'is_training': True,
@@ -60,39 +87,61 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
                             'epsilon': 0.001,
                             'updates_collections': tf.GraphKeys.UPDATE_OPS,
                             'fused': None}):
-        with slim.arg_scope([slim.conv2d, slim.max_pool2d],
-                             stride=1, padding='SAME'):
-            with tf.variable_scope("extra_inception_module_0", reuse=reuse):
-                with tf.variable_scope("Branch_0"):
-                    branch_0 = slim.conv2d(net, 32, [1, 1], scope='Conv2d_0a_1x1')
-                with tf.variable_scope("Branch_1"):
-                    branch_1 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
-                    branch_1 = slim.conv2d(branch_1, 32, [3, 3], scope='Conv2d_0b_3x3')
-                with tf.variable_scope("Branch_2"):
-                    branch_2 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
-                    branch_2 = slim.conv2d(branch_2, 32, [5, 5], scope='Conv2d_0b_3x3')
-                with tf.variable_scope("Branch_3"):
-                    branch_3 = slim.max_pool2d(net, [3, 3], scope='MaxPool_0a_3x3')
-                    branch_3 = slim.conv2d(branch_3, 64, [1, 1], scope='Conv2d_0b_1x1')
 
-                net = tf.concat(axis=3, values=[branch_0, branch_1, branch_2, branch_3])
+        backbone = slim.conv2d(backbone, 2048, [2,2], scope='backbone_refined')
 
-                # `inception_net' has 1024 channels and `net' has 160 channels.
-                #
-                # TODO: in the original paper, it is not directly added together.
-                # Instead, `inception_net' should be at least x times the size
-                # of `net' such that we can "pool concat" them.
-                net = tf.concat(axis=3, values=[inception_net, net])
+        # Follow the number of output in YOLOv3
+        # Use sigmoid the constraint output to [0, 1]
+        net = slim.conv2d(
+                backbone,
+                num_of_anchor_boxes * (5 + num_of_classes),
+                [1, 1],
+                scope="Final_output"
+            )
+    return net, vars_to_restore
 
-                # Follow the number of output in YOLOv3
-                # Use sigmoid the constraint output to [0, 1]
-                with slim.arg_scope([slim.conv2d], activation_fn=tf.nn.sigmoid):
-                    net = slim.conv2d(
-                            net,
-                            num_of_anchor_boxes * (5 + num_of_classes),
-                            [1, 1],
-                            scope="Final_output"
-                        )
+#    with slim.arg_scope([slim.conv2d],
+#                        weights_initializer=trunc_normal(0.01),
+#                        normalizer_fn=slim.batch_norm,
+#                        normalizer_params={
+#                            'is_training': True,
+#                            'decay':0.95,
+#                            'epsilon': 0.001,
+#                            'updates_collections': tf.GraphKeys.UPDATE_OPS,
+#                            'fused': None}):
+#        with slim.arg_scope([slim.conv2d, slim.max_pool2d],
+#                             stride=1, padding='SAME'):
+#            with tf.variable_scope("extra_inception_module_0", reuse=reuse):
+#                with tf.variable_scope("Branch_0"):
+#                    branch_0 = slim.conv2d(net, 32, [1, 1], scope='Conv2d_0a_1x1')
+#                with tf.variable_scope("Branch_1"):
+#                    branch_1 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
+#                    branch_1 = slim.conv2d(branch_1, 32, [3, 3], scope='Conv2d_0b_3x3')
+#                with tf.variable_scope("Branch_2"):
+#                    branch_2 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
+#                    branch_2 = slim.conv2d(branch_2, 32, [5, 5], scope='Conv2d_0b_3x3')
+#                with tf.variable_scope("Branch_3"):
+#                    branch_3 = slim.max_pool2d(net, [3, 3], scope='MaxPool_0a_3x3')
+#                    branch_3 = slim.conv2d(branch_3, 64, [1, 1], scope='Conv2d_0b_1x1')
+#
+#                net = tf.concat(axis=3, values=[branch_0, branch_1, branch_2, branch_3])
+#
+#                # `inception_net' has 1024 channels and `net' has 160 channels.
+#                #
+#                # TODO: in the original paper, it is not directly added together.
+#                # Instead, `inception_net' should be at least x times the size
+#                # of `net' such that we can "pool concat" them.
+#                net = tf.concat(axis=3, values=[inception_net, net])
+#
+#                # Follow the number of output in YOLOv3
+#                # Use sigmoid the constraint output to [0, 1]
+#                with slim.arg_scope([slim.conv2d], activation_fn=tf.nn.sigmoid):
+#                    net = slim.conv2d(
+#                            net,
+#                            num_of_anchor_boxes * (5 + num_of_classes),
+#                            [1, 1],
+#                            scope="Final_output"
+#                        )
 
     # tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
     # tf.summary.histogram("all_bias", tf.contrib.layers.summarize_collection(tf.GraphKeys.BIASES))
@@ -102,16 +151,17 @@ def YOLOvx(images, num_of_anchor_boxes, num_of_classes, freeze_backbone,
 
     # NOTE all the values output in `net` are relative to the cell size, not the
     # whole image
-    return net, vars_to_restore
+    # return net, vars_to_restore
 
 class YOLOLoss():
     """ Provides methods for calculating loss """
 
-    def __init__(self, batch_size, num_of_anchor_boxes,
-                 num_of_classes, num_of_gt_bnx_per_cell):
+    def __init__(self, batch_size, num_of_anchor_boxes, num_of_classes,
+                 num_of_gt_bnx_per_cell, global_step):
         """
           Args:
             (see their difinition in FLAGS)
+            global_step: A tensor, used to switch between loss function
         """
         # NOTE, though we can know batch_size when building the network/loss,
         # but we are not using it anywhere when building then network/loss,
@@ -120,6 +170,7 @@ class YOLOLoss():
         self.num_of_anchor_boxes = num_of_anchor_boxes
         self.num_of_classes = num_of_classes
         self.num_of_gt_bnx_per_cell = num_of_gt_bnx_per_cell
+        self.global_step = global_step
 
     @staticmethod
     def sigmoid(x):
@@ -329,6 +380,21 @@ class YOLOLoss():
         objectness_se_real_gt = objectness_se * objectness_se_ceil
         objectness_loss = tf.reduce_sum(objectness_se_real_gt)
 
+        # objectness loss for those non-object class
+        # NOTE, these output may not be the responsible prediction for this
+        # ground truth, but it may be responsible for another ground_truth.
+        non_objectness_se = tf.pow(ious[:, :, :, 2, 4]-0, 2)
+        non_objectness_se_ceil = tf.ceil(ious[:, :, :, 1, 2])
+        non_objectness_se_real_gt = non_objectness_se * non_objectness_se_ceil
+        non_objectness_loss = tf.reduce_sum(non_objectness_se_real_gt)
+        # because we include the box which is responsible for the prediction,
+        # here we substract it back.
+        wrong_non_objectness_se = tf.pow(ious_max[:, :, 2, 4]-0,2)
+        wrong_non_objectness_se_real_gt = wrong_non_objectness_se * objectness_se_ceil
+        wrong_non_objectness_loss = tf.reduce_sum(wrong_non_objectness_se_real_gt)
+
+        non_objectness_loss = non_objectness_loss - wrong_non_objectness_loss
+
         #TODO now we have only one class so we are hard-code that the class
         # is at position 0
         classness_se = tf.pow(ious_max[:, :, 2, 0] - 1, 2)
@@ -336,7 +402,13 @@ class YOLOLoss():
         classness_se_real_gt = classness_se * classness_se_ceil
         classness_loss = tf.reduce_sum(classness_se_real_gt)
 
-        all_loss = coordinate_loss + objectness_loss + classness_loss
+        # NOTE with only one class, eliminate the classness_loss burden from the
+        # network (because it is stochastic and I don't want classness_loss to
+        # hurt performance...)
+        all_loss = tf.cond(self.global_step <= 2500,
+                           lambda: 0.5*coordinate_loss + 5*objectness_loss + 3*non_objectness_loss, # + classness_loss
+                           lambda: 1*coordinate_loss + 5*objectness_loss + 3*non_objectness_loss # + classness_loss
+                        )
 
         return all_loss
 

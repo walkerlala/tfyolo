@@ -19,19 +19,22 @@ tf.app.flags.DEFINE_boolean("is_training", True, "To train or not to train.")
 tf.app.flags.DEFINE_boolean("freeze_backbone", False,
         "Freeze the backbone network or not")
 
-tf.app.flags.DEFINE_string("checkpoint_file", "./inception_v1.ckpt",
+# TODO mark some args as co-exist, and backbone_arch should have limited choice
+tf.app.flags.DEFINE_string("checkpoint", "./vgg_16.ckpt",
         "Path of checkpoint file. Must come with its parent dir name, "
         "even it is in the current directory (eg, ./model.ckpt).")
 tf.app.flags.DEFINE_boolean("restore_all_variables", False,
         "Whether or not to restore all variables. Default to False, which "
         "means restore only variables for the backbone network")
+tf.app.flags.DEFINE_string("backbone_arch", "vgg_16",
+        "Avaliable backbone architecture are 'vgg_16' and 'inception_v1'")
 
 tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolo_train_dir",
         "Path to save checkpoints")
 tf.app.flags.DEFINE_string("train_log_dir", "/disk1/yolotraining/",
         "Path to save tfevent (for tensorboard)")
 
-tf.app.flags.DEFINE_integer("batch_size", 50, "Batch size.")
+tf.app.flags.DEFINE_integer("batch_size", 64, "Batch size.")
 
 tf.app.flags.DEFINE_integer("num_of_classes", 1, "Number of classes.")
 
@@ -252,7 +255,7 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
                             output[...,0:4],
                             output[..., 4],
                             max_output_size=10000,
-                            iou_threshold=0.6
+                            iou_threshold=0.5
                         )
         # mask non-selected box
         one_hot = tf.one_hot(selected_indices, tf.shape(output)[0], dtype=output.dtype)
@@ -310,10 +313,11 @@ def train():
     num_of_anchor_boxes = FLAGS.num_of_anchor_boxes
     num_of_gt_bnx_per_cell = FLAGS.num_of_gt_bnx_per_cell
     num_of_steps = FLAGS.num_of_steps
-    checkpoint_file = FLAGS.checkpoint_file
+    checkpoint = FLAGS.checkpoint
     restore_all_variables = FLAGS.restore_all_variables
     train_ckpt_dir = FLAGS.train_ckpt_dir
     train_log_dir = FLAGS.train_log_dir
+    backbone_arch = FLAGS.backbone_arch
     freeze_backbone = FLAGS.freeze_backbone
     infer_threshold = FLAGS.infer_threshold
 
@@ -327,35 +331,39 @@ def train():
     # Because we have variable size of input, w/h of image are both None (but
     # note that they will eventually have a shape)
     _x = tf.placeholder(tf.float32, [None, None, None, 3])
-    _y, backbone_vars = YOLOvx(_x,
-                               num_of_anchor_boxes=num_of_anchor_boxes,
-                               num_of_classes=num_of_classes,
-                               freeze_backbone=freeze_backbone,
-                               reuse=tf.AUTO_REUSE)
+    _y, vars_to_restore = YOLOvx(_x,
+                                 backbone_arch=backbone_arch,
+                                 num_of_anchor_boxes=num_of_anchor_boxes,
+                                 num_of_classes=num_of_classes,
+                                 freeze_backbone=freeze_backbone,
+                                 reuse=tf.AUTO_REUSE)
     _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
+
+    global_step = tf.Variable(0, name='self_global_step',
+                              trainable=False, dtype=tf.int32)
 
     all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
     # Not all var in the backbone graph are trainable.
-    all_vars.extend(backbone_vars)
+    all_vars.extend(vars_to_restore)
     all_vars = list(set(all_vars))
+    all_vars.append(global_step)
 
     losscal = YOLOLoss(
                   batch_size=batch_size,
                   num_of_anchor_boxes=num_of_anchor_boxes,
                   num_of_classes=num_of_classes,
-                  num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                  num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell,
+                  global_step=global_step
                 )
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
-    global_step = tf.Variable(0, name='self_global_step', trainable=False)
-    all_vars.append(global_step)
 
     starter_learning_rate = 1e-4
     learning_rate = tf.train.exponential_decay(
             learning_rate=starter_learning_rate,
             global_step=global_step,
-            decay_steps=200,
-            decay_rate=0.9,
+            decay_steps=500,
+            decay_rate=0.95,
             staircase=True
         )
     # train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
@@ -386,7 +394,7 @@ def train():
                                     gt_scaled,
                                     num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
                                 )
-    # tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
+    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
     tf.logging.info("All network loss/train_step built! Yah!")
 
@@ -406,18 +414,18 @@ def train():
         os.makedirs(train_log_dir)
     elif not os.path.isdir(train_log_dir):
         print("{} already exists and is not a dir. Exit.".format(train_log_dir))
+        exit(1)
     train_writer = tf.summary.FileWriter(train_log_dir, sess.graph)
 
     sess.run(initializer)
 
     if restore_all_variables:
-        vars_to_restore = all_vars
+        restorer = tf.train.Saver(all_vars)
     else:
-        vars_to_restore = backbone_vars
-    restorer = tf.train.Saver(vars_to_restore)
-    restorer.restore(sess, checkpoint_file)
+        restorer = tf.train.Saver(vars_to_restore)
+    restorer = restorer.restore(sess, checkpoint)
+    tf.logging.info("checkpoint restored!")
     # value of `global_step' is restored as well
-    tf.logging.info("Checkpoint restored!")
     saver = tf.train.Saver(all_vars)
 
     idx = sess.run(global_step)
@@ -448,7 +456,10 @@ def train():
                 options=run_option,
                 # run_metadata=run_metadata,
             )
-        train_writer.add_summary(train_summary, idx)
+        # validate per 200 iterations
+        if (idx+1) % 200 == 0:
+            train_writer.add_summary(train_summary, idx)
+
         elapsed_time = datetime.datetime.now() - start_time
         sys.stdout.write(
           "Elapsed time: {}, LossVal: {:10.10f} | ".format(elapsed_time, loss_val)
