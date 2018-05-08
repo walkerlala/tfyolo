@@ -310,7 +310,7 @@ class YOLOLoss():
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
-        ious_0 = YOLOLoss.bbox_iou_center_xy_batch(
+        ious = YOLOLoss.bbox_iou_center_xy_batch(
                             gt_boxes[:, :, 1:5],
                             op_boxes[:, :, 0:4]
                           )
@@ -350,66 +350,75 @@ class YOLOLoss():
         # to calculate loss. That way, if it is a fake gt box with [0,0,0,0,0]
         # tf.ceil() will return 0, doing no harm.
         #
-        # Note that to make it "no harm" for those real gt box, a real gt box
-        # should contain coordinates < 1 (if > 1, you can also scale it to
-        # <1 before using tf.ceil())
+        # Note that to make it "no harm", a real gt box should contain coordinates
+        # < 1 such that tf.ceil() return 1.
 
-        # get each gt's max iou and do some necessary padding
-        ious = self.bbox_iou_center_xy_pad_original(gt_boxes, op_boxes)
-        # ious of shape
-        #   [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
-        # with
-        #   [:, :, :, 0, 0] the iou, and [:, :, :, 0, :] padded to 5+num_of_classes
-        #   [:, :, :, 1, :] the ground_truth, padded to 5+num_of_classes
-        #   [:, :, :, 2, :] the output
-        # We reduce along the 2 axis here, that is, find the max ious for
-        # each ground truth box.
-        ious_max = tf.reduce_max(ious, axis=2, keepdims=False)
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        ious = YOLOLoss.bbox_iou_center_xy_batch(
+                                gt_boxes[:, :, 1:5],
+                                op_boxes[:, :, 0:4]
+                            )
+        # [-1, num_of_gt_bnx_per_cell, 1]
+        values, idx = tf.nn.top_k(ious, k=1)
+        # [-1, num_of_gt_bnx_per_cell] (just squeeze the last dimension)
+        idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
 
-        # TODO gradient of tf.sqrt will probably be -NaN, so we use pow for all
+        # Get tuples of (gt, op) with the max iou (i.e., those who match)
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+        full_idx = tf.where(tf.equal(1.0, one_hot_idx))
+        gt_idx = full_idx[:, 0:2]
+        op_idx = full_idx[:, 0:3:2]
+        # [?, 5]
+        gt_boxes_max = tf.gather_nd(gt_boxes, gt_idx)
+        # [?, 5+num_of_classes]
+        op_boxes_max = tf.gather_nd(op_boxes, op_idx)
+        # [?, 5+num_of_classes + 5]
+        # NOTE the order in which they are concatenated!
+        iou_max_boxes = tf.concat([op_boxes_max, gt_boxes_max], axis=1)
+
+        # Get those op boxes which were never matched by any gt box
+        mask = tf.reduce_max(one_hot_idx, axis=-2)
+        op_never_max_indices = tf.where(tf.equal(0.0, mask))
+        never_max_op_boxes = tf.gather_nd(op_boxes, op_never_max_indices)
+
+        #coordinate loss
+        _5_nc = 5+num_of_classes
         cooridniates_se_wh = tf.sqrt(
-                tf.pow(ious_max[:, :, 2, 2:4] - ious_max[:, :, 1, 3:5], 2)+0.0001)
-        cooridniates_se_xy = tf.pow(ious_max[:, :, 2, 0:2] - ious_max[:, :, 1, 1:3], 2)
+            tf.pow(iou_max_boxes[:, 2:4]-iou_max_boxes[:, _5_nc+3:_5_nc+5], 2)+0.0001
+        )
+        cooridniates_se_xy = tf.pow(iou_max_boxes[:, 0:2]-iou_max_boxes[:, _5_nc+1:_5_nc+3], 2)
         cooridniates_se = tf.concat([cooridniates_se_xy, cooridniates_se_wh], axis=-1)
-        cooridniates_se_ceil = tf.ceil(ious_max[:, :, 1, 1:5])
+        cooridniates_se_ceil = tf.ceil(iou_max_boxes[:, _5_nc+1:])
         cooridniates_se_real_gt = cooridniates_se * cooridniates_se_ceil
-        coordinate_loss = tf.reduce_sum(cooridniates_se_real_gt)
+        cooridniates_loss = tf.reduce_sum(cooridniates_se_real_gt)
 
-        objectness_se = tf.pow(ious_max[:, :, 2, 4] - 1, 2)
-        objectness_se_ceil = tf.ceil(ious_max[:, :, 1, 2])
+        # objectness loss
+        #
+        objectness_se = tf.pow(iou_max_boxes[:, 4]-1, 2)
+        objectness_se_ceil = tf.ceil(iou_max_boxes[:, _5_nc+2])
         objectness_se_real_gt = objectness_se * objectness_se_ceil
         objectness_loss = tf.reduce_sum(objectness_se_real_gt)
-
-        # objectness loss for those non-object class
-        # NOTE, these output may not be the responsible prediction for this
-        # ground truth, but it may be responsible for another ground_truth.
-        non_objectness_se = tf.pow(ious[:, :, :, 2, 4]-0, 2)
-        non_objectness_se_ceil = tf.ceil(ious[:, :, :, 1, 2])
+        # usually all fake gt boxes will consume a single anchor boxes which
+        # should contain non-object. So here we calculate the non-objectness
+        # loss for that mis-included-should-be-not-matched boxes.
+        non_objectness_se = tf.pow(iou_max_boxes[:, 4]-0, 2)
+        non_objectness_se_ceil = 1 - objectness_se_ceil # select those boxes
         non_objectness_se_real_gt = non_objectness_se * non_objectness_se_ceil
         non_objectness_loss = tf.reduce_sum(non_objectness_se_real_gt)
-        # because we include the box which is responsible for the prediction,
-        # here we substract it back.
-        wrong_non_objectness_se = tf.pow(ious_max[:, :, 2, 4]-0,2)
-        wrong_non_objectness_se_real_gt = wrong_non_objectness_se * objectness_se_ceil
-        wrong_non_objectness_loss = tf.reduce_sum(wrong_non_objectness_se_real_gt)
+        non_objectness_loss = non_objectness_loss / num_of_gt_bnx_per_cell
 
-        non_objectness_loss = non_objectness_loss - wrong_non_objectness_loss
+        #classness loss (TODO)
 
-        #TODO now we have only one class so we are hard-code that the class
-        # is at position 0
-        classness_se = tf.pow(ious_max[:, :, 2, 0] - 1, 2)
-        classness_se_ceil = tf.ceil(ious_max[:, :, 1, 2])
-        classness_se_real_gt = classness_se * classness_se_ceil
-        classness_loss = tf.reduce_sum(classness_se_real_gt)
+        # NOTE usually never_max_op_boxes should be empty
+        never_max_loss = tf.reduce_sum(tf.pow(never_max_op_boxes[:, 4]-0, 2))
+        # assert_op = tf.Assert(never_max_loss==0.0, [never_max_op_boxes])
 
-        # NOTE with only one class, eliminate the classness_loss burden from the
-        # network (because it is stochastic and I don't want classness_loss to
-        # hurt performance...)
-        all_loss = tf.cond(self.global_step <= 2500,
-                           lambda: 0.5*coordinate_loss + 5*objectness_loss + 3*non_objectness_loss, # + classness_loss
-                           lambda: 1*coordinate_loss + 5*objectness_loss + 3*non_objectness_loss # + classness_loss
-                        )
-
+        # with tf.control_dependencies([assert_op]):
+        all_loss = (cooridniates_loss +
+                    5*objectness_loss +
+                    1*non_objectness_loss +
+                    never_max_loss)
         return all_loss
 
     def calculate_loss(self, output, ground_truth):
