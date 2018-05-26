@@ -358,15 +358,15 @@ def train():
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
 
-    starter_learning_rate = 1e-4
-    learning_rate = tf.train.exponential_decay(
-            learning_rate=starter_learning_rate,
-            global_step=global_step,
-            decay_steps=500,
-            decay_rate=0.95,
-            staircase=True
-        )
-    # train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
+    # starter_learning_rate = 1e-4
+    # learning_rate = tf.train.exponential_decay(
+    #         learning_rate=starter_learning_rate,
+    #         global_step=global_step,
+    #         decay_steps=500,
+    #         decay_rate=0.95,
+    #         staircase=True
+    #     )
+    learning_rate = 1e-3
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
 

@@ -334,11 +334,44 @@ class YOLOLoss():
         bundle = tf.concat([ious, op_gt_bundle], -2)
         return bundle
 
-    def calculate_loss_inner(self, op_and_gt_batch):
+    def calculate_loss(self, output, ground_truth):
+        """ Calculate loss using the loss from yolov1 + yolov2.
+
+          Args:
+            output: Computed output from the network. In shape
+                    [batch_size,
+                        image_size/32,
+                            image_size/32,
+                                (num_of_anchor_boxes * (5 + num_of_classes))]
+            ground_truth: Ground truth bounding boxes.
+                          In shape [batch_size,
+                                      image_size/32,
+                                        image_size/32,
+                                          5 * num_of_gt_bnx_per_cell].
+          Return:
+              loss: The final loss.
+        """
 
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
+
+        # shape of output:
+        #   [?, ?, ?, num_of_anchor_boxes * (5 + num_of_classes))
+        # shape of ground_truth:
+        #   [?, ?, ?, 5 * num_of_gt_bnx_per_cell]
+
+        # concat ground_truth and output to make a tensor of shape 
+        #   (?, ?, ?, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell)
+        output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
+                                            name="output_and_ground_truth_concat")
+
+        # flatten dimension
+        op_and_gt_batch = \
+            tf.reshape(
+                output_and_ground_truth,
+                [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
+            )
 
         split_num = num_of_anchor_boxes*(5+num_of_classes)
         op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
@@ -359,13 +392,21 @@ class YOLOLoss():
                                 op_boxes[:, :, 0:4]
                             )
         # [-1, num_of_gt_bnx_per_cell, 1]
-        values, idx = tf.nn.top_k(ious, k=1)
-        # [-1, num_of_gt_bnx_per_cell] (just squeeze the last dimension)
+        top_values, idx = tf.nn.top_k(ious, k=1)
+        # [-1, num_of_gt_bnx_per_cell] (squeeze the last dimension)
         idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
 
         # Get tuples of (gt, op) with the max iou (i.e., those who match)
         # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
         one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+
+        # (?, 3), something like
+        #    [[0,1,2],
+        #     [0,2,2],
+        #     [0,3,0],
+        #     [1,1,2],
+        #     [1,2,2]]
+        # across batches.
         full_idx = tf.where(tf.equal(1.0, one_hot_idx))
         gt_idx = full_idx[:, 0:2]
         op_idx = full_idx[:, 0:3:2]
@@ -399,71 +440,44 @@ class YOLOLoss():
         objectness_se_ceil = tf.ceil(iou_max_boxes[:, _5_nc+2])
         objectness_se_real_gt = objectness_se * objectness_se_ceil
         objectness_loss = tf.reduce_sum(objectness_se_real_gt)
-        # usually all fake gt boxes will consume a single anchor boxes which
-        # should contain non-object. So here we calculate the non-objectness
-        # loss for that mis-included-should-be-not-matched boxes.
-        non_objectness_se = tf.pow(iou_max_boxes[:, 4]-0, 2)
-        non_objectness_se_ceil = 1 - objectness_se_ceil # select those boxes
-        non_objectness_se_real_gt = non_objectness_se * non_objectness_se_ceil
-        non_objectness_loss = tf.reduce_sum(non_objectness_se_real_gt)
-        non_objectness_loss = non_objectness_loss / num_of_gt_bnx_per_cell
+
+        def unique_with_ori_index(x):
+            res = tf.cumsum(tf.pad(tf.unique_with_counts(x)[2],[[1,0]]))[:-1]
+            return res
+        where = tf.where(tf.equal(0.0, objectness_se_ceil))
+        # mis_included_non_match_boxes = tf.gather_nd(iou_max_boxes[:, 4:5], where)
+        # mis_included_non_objectness = tf.pow(mis_included_non_objectness[:, 0]-0, 2)
+        mis_included_full_idx = tf.gather_nd(full_idx, where)
+        mis_included_full_idx_idx = unique_with_ori_index(mis_included_full_idx[:, 0])
+        mis_included_full_idx_idx = tf.reshape(mis_included_full_idx_idx, [-1, 1])
+        unique_full_idx = tf.gather_nd(full_idx, mis_included_full_idx_idx)
+        mis_included_op_boxes_idx = unique_full_idx[:, 0:3:2]
+        mis_included_op_boxes = tf.gather_nd(op_boxes, mis_included_op_boxes_idx)
+        mis_included_non_objectness = tf.pow(mis_included_op_boxes[:, 4]-0, 2)
+        mis_included_non_objectness = tf.reduce_sum(mis_included_non_objectness)
+
+        # usually some fake gt boxes will consume a single anchor box (index 0) which
+        # should contain non-object. So here we calculate the number of
+        # mis-count for that mis-included-should-be-not-matched boxes.
+#        top_values_flat = tf.cast(tf.reshape(top_values, [-1, 1]), tf.int64)
+#        full_idx_with_values = tf.concat([full_idx[:, 0:1], top_values_flat], axis=-1)
+#        part = parts[:, 1]
+#        where = tf.where(tf.equal(tf.constant(0, dtype=tf.int64), part))
+#        gather_nd = tf.gather_nd(op_idx, where)
+#        gather_plus = gather_nd[:, 0] + gather_nd[:, 1]
+#        unique_values, _ = tf.unique(gather_plus)
+#        miscount = tf.shape(unique_values)[0]
+
+        never_max_loss = tf.reduce_sum(tf.pow(never_max_op_boxes[:, 4]-0, 2))
+        non_objectness_loss = never_max_loss #+ mis_included_non_objectness
+
+        # objectness_loss = tf.Print(objectness_loss, [cooridniates_loss, objectness_loss, non_objectness_loss], "cl, ol, nol: ", summarize=100000)
 
         #classness loss (TODO)
 
-        # NOTE usually never_max_op_boxes should be empty
-        never_max_loss = tf.reduce_sum(tf.pow(never_max_op_boxes[:, 4]-0, 2))
-        # assert_op = tf.Assert(never_max_loss==0.0, [never_max_op_boxes])
-
         # with tf.control_dependencies([assert_op]):
-        all_loss = (cooridniates_loss +
-                    5*objectness_loss +
-                    1*non_objectness_loss +
-                    never_max_loss)
-        return all_loss
-
-    def calculate_loss(self, output, ground_truth):
-        """ Calculate loss using the loss from yolov1 + yolov2.
-
-          Args:
-            output: Computed output from the network. In shape
-                    [batch_size,
-                        image_size/32,
-                            image_size/32,
-                                (num_of_anchor_boxes * (5 + num_of_classes))]
-            ground_truth: Ground truth bounding boxes.
-                          In shape [batch_size,
-                                      image_size/32,
-                                        image_size/32,
-                                          5 * num_of_gt_bnx_per_cell].
-          Return:
-              loss: The final loss (after tf.reduce_mean()).
-        """
-
-        num_of_anchor_boxes = self.num_of_anchor_boxes
-        num_of_classes = self.num_of_classes
-        num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
-
-        # shape of output:
-        #   [?, ?, ?, num_of_anchor_boxes * (5 + num_of_classes))
-        # shape of ground_truth:
-        #   [?, ?, ?, 5 * num_of_gt_bnx_per_cell]
-
-        # concat ground_truth and output to make a tensor of shape 
-        #   (?, ?, ?, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell)
-        output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
-                                            name="output_and_ground_truth_concat")
-
-        shape = tf.shape(output_and_ground_truth)
-        batch_size = shape[0]
-        row_num = shape[1]
-        # flatten dimension
-        output_and_ground_truth = \
-                tf.reshape(
-                    output_and_ground_truth,
-                    [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
-                )
-
         with tf.variable_scope("calculate_loss_inner_scope"):
-            loss = self.calculate_loss_inner(output_and_ground_truth)
+            loss = (cooridniates_loss +
+                    5*objectness_loss) #+
+                    #0.5*non_objectness_loss)
         return loss
-
