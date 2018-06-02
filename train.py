@@ -1,6 +1,10 @@
 #!/usr/bin/python
 #coding:utf-8
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import datetime
 import os
 import pdb
@@ -23,6 +27,8 @@ tf.app.flags.DEFINE_boolean("freeze_backbone", False,
 tf.app.flags.DEFINE_string("checkpoint", "./vgg_16.ckpt",
         "Path of checkpoint file. Must come with its parent dir name, "
         "even it is in the current directory (eg, ./model.ckpt).")
+tf.app.flags.DEFINE_boolean("use_checkpoint", True,
+        "Whether or not to use checkpoint")
 tf.app.flags.DEFINE_boolean("restore_all_variables", False,
         "Whether or not to restore all variables. Default to False, which "
         "means restore only variables for the backbone network")
@@ -221,25 +227,23 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
         output_row_num = output_shape[1]
 
         output = tf.reshape(output, [-1, 5+num_of_classes])
-        # output_bool = tf.equal(output, tf.constant([0.0]))
-        # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
-        # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
-
-        # get P(class) = P(object) * P(class|object)
-        # p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
-        # output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
 
         # mask all the bounding boxes whose objectness value is not greater than
         # threshold.
         output_idx = output[..., 4]
+        pre_output_idx_sum = tf.reduce_sum(output_idx)
+        tf.summary.scalar("pre_output_idx_sum", pre_output_idx_sum)
         mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
         mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
+        count = tf.reduce_sum(mask)
+        tf.summary.scalar("gt_infer_threshold_N", count)
         masked_output = output * mask
         # TODO now we just draw all the box, regardless of its classes.
         boxes_x = masked_output[..., 0:1]
         boxes_y = masked_output[..., 1:2]
         boxes_w = masked_output[..., 2:3]
         boxes_h = masked_output[..., 3:4]
+
         output_rhs = masked_output[..., 4:]
         output = tf.concat([
                 boxes_y - boxes_h/2, # ymin
@@ -267,6 +271,10 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
                 [batch_size,
                     output_row_num * output_row_num * num_of_anchor_boxes,
                         5+num_of_classes])
+        # output = tf.Print(output, [output[..., 0:5]], "++++: ", summarize=1000)
+        output = output[..., 0:4]
+        output = tf.clip_by_value(output, 0.1, 0.9)
+        # output = tf.Print(output, [output], "....: ", summarize=1000)
         result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
         return result
 
@@ -281,7 +289,7 @@ def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell)
           images with boxes on it.
     """
     with tf.variable_scope("build_image_scope"):
-        feature_map_len = tf.shape(images)[1]/32
+        feature_map_len = tf.cast(tf.shape(images)[1]/32, tf.int32)
         ground_truth = tf.reshape(
                             ground_truth,
                             [-1, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
@@ -314,6 +322,7 @@ def train():
     num_of_gt_bnx_per_cell = FLAGS.num_of_gt_bnx_per_cell
     num_of_steps = FLAGS.num_of_steps
     checkpoint = FLAGS.checkpoint
+    use_checkpoint = FLAGS.use_checkpoint
     restore_all_variables = FLAGS.restore_all_variables
     train_ckpt_dir = FLAGS.train_ckpt_dir
     train_log_dir = FLAGS.train_log_dir
@@ -366,9 +375,10 @@ def train():
     #         decay_rate=0.95,
     #         staircase=True
     #     )
-    learning_rate = 1e-3
+    learning_rate = 1e-2
     optimizer = tf.train.AdamOptimizer(learning_rate)
-    train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
+    # train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
+    train_step = optimizer.minimize(loss, global_step=global_step)
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     if update_ops:
@@ -378,9 +388,10 @@ def train():
     # scale x/y coordinates of output of the neural network to be relative of
     # the whole image.
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
+
     y_scaled = scale_output(_y, output_scale_placeholder,
-                                 num_of_anchor_boxes=num_of_anchor_boxes,
-                                 num_of_classes=num_of_classes)
+                            num_of_anchor_boxes=num_of_anchor_boxes,
+                            num_of_classes=num_of_classes)
     validation_images = validation(output=y_scaled, images=_x,
                                    num_of_anchor_boxes=num_of_anchor_boxes,
                                    num_of_classes=num_of_classes,
@@ -419,12 +430,13 @@ def train():
 
     sess.run(initializer)
 
-    if restore_all_variables:
-        restorer = tf.train.Saver(all_vars)
-    else:
-        restorer = tf.train.Saver(vars_to_restore)
-    restorer = restorer.restore(sess, checkpoint)
-    tf.logging.info("checkpoint restored!")
+    if use_checkpoint:
+        if restore_all_variables:
+            restorer = tf.train.Saver(all_vars)
+        else:
+            restorer = tf.train.Saver(vars_to_restore)
+        restorer = restorer.restore(sess, checkpoint)
+        tf.logging.info("checkpoint restored!")
     # value of `global_step' is restored as well
     saver = tf.train.Saver(all_vars)
 
@@ -432,8 +444,8 @@ def train():
     while idx != num_of_steps:
         # Change size every 100 steps.
         # `size' is the size of input image, not the final feature map size.
-        image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
-        if idx % 100 == 0 and idx:
+        image_size = variable_sizes[int(idx/100) % len(variable_sizes)]
+        if idx % 200 == 0 and idx:
             print("Switching to another image size: %d" % image_size)
 
         batch_xs, batch_ys, outscale = reader.next_batch(
@@ -457,7 +469,7 @@ def train():
                 # run_metadata=run_metadata,
             )
         # validate per 200 iterations
-        if (idx+1) % 200 == 0:
+        if (idx+1) % 50 == 0:
             train_writer.add_summary(train_summary, idx)
 
         elapsed_time = datetime.datetime.now() - start_time

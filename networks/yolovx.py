@@ -9,9 +9,11 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
+import copy
 import math
 import pdb
 import tensorflow as tf
+from tensorflow.python.framework import ops
 from backbone.inception_v1 import inception_v1
 from backbone.vgg import vgg_16
 from backbone.vgg import vgg_arg_scope
@@ -19,10 +21,99 @@ from backbone.inception_utils import inception_arg_scope
 
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
+random_normal = lambda stddev: tf.random_normal_initializer(0.0, stddev)
 
 FLAGS = tf.app.flags.FLAGS
 
+def sigmoid_0(x):
+    """When x==0, sigmoid_0(x) == 0 """
+    return math.exp(-np.logaddexp(0, -x)) - 0.5
+    # return 1 / (1 + math.exp(-x))
+
+def fit_anchor_boxes(op_boxes, num_of_anchor_boxes):
+    """ All anchor boxes will be located like
+
+        +----------+     +-----------+
+        |  .    .  |     |  .      . |
+        |    .     |  or |  .      . |
+        |  .    .  |     |  .      . |
+        +----------+     +-----------+
+          5 anchors        6 anchors
+
+        All anchor boxes of the same shape.
+
+        op_boxes of shape:
+            [num_of_anchor_boxes, 5+num_of_classes]
+    """
+    # op_boxes = copy.deepcopy(_op_boxes)
+    def is_even(x):
+        return x%2 == 0
+    def get_coord(idx, num):
+        """Get x/y coordinate of anchor"""
+        # idx start from 0
+        if not is_even(num) and idx == int(num/2.0):
+            return 0.5
+        if not is_even(num):
+            num -= 1
+        if idx > int(num/2.0):
+            idx -= 1
+        piece_len = 1.0 / num
+        return piece_len * idx + piece_len/2.0
+
+    num = int(math.sqrt(num_of_anchor_boxes))
+    result_opboxes = []
+    for idx, obox in enumerate(op_boxes):
+        if not is_even(num_of_anchor_boxes) and idx == int(num_of_anchor_boxes/2)+1:
+            xcoord = 0.5
+            ycoord = 0.5
+        else:
+            xidx = idx%num # start from 0
+            yidx = idx/num # start from 0
+            xcoord = get_coord(xidx, num)
+            ycoord = get_coord(yidx, num)
+
+        fit_xcoord = min(sigmoid_0(obox[0]) + xcoord, 0.999)
+        obox[0] = fit_xcoord
+        fit_ycoord = min(sigmoid_0(obox[1]) + ycoord, 0.999)
+        obox[1] = fit_ycoord
+        #TODO w/h fixed
+        fit_w = max(min(sigmoid_0(np.exp(obox[2])), 0.999), 0.01)
+        obox[2] = fit_w
+        fit_h = max(min(sigmoid_0(np.exp(obox[3])), 0.999), 0.01)
+        obox[3] = fit_h
+        # obox[4] = sigmoid_0(obox[4])
+        obox[4] = obox[4]
+        # print("objectness is: " + str(obox[4]))
+        #TODO for classes
+        result_opboxes.append(obox)
+    return np.array(result_opboxes)
+
+def py_fit_anchor_boxes(net, num_of_anchor_boxes, num_of_classes):
+    """Translate output of the network with predefined anchor boxes """
+
+    def _py_func_identity_grad(op, grad):
+        # grad = tf.Print(grad, [grad], "+++grad: ", summarize=1000)
+        # return tf.ones_like(op.inputs[0]) * grad
+        # return op.inputs[0] * grad
+        return grad
+
+    def fit_anchor_boxes_all(net):
+        original_shape = np.shape(net)
+        net = np.reshape(net, [-1, num_of_anchor_boxes, 5+num_of_classes])
+        for idx, op_boxes in enumerate(net):
+            net[idx] = fit_anchor_boxes(op_boxes, num_of_anchor_boxes)
+        return np.reshape(net, original_shape)
+
+    with tf.name_scope("pyfunc_fit_anchor", "net_fit_anchor", [net]):
+        rnd_name = 'PyFuncGrad' + str(np.random.randint(0, 1E+8))
+        tf.RegisterGradient(rnd_name)(_py_func_identity_grad)
+        default_graph = tf.get_default_graph()
+        with default_graph.gradient_override_map({"PyFunc": rnd_name}):
+            net = tf.py_func(fit_anchor_boxes_all, [net], [tf.float32], stateful=True)
+    return net[0]
+
 def backbone_network(images, backbone_arch, reuse):
+    """Which backbone network to use"""
 
     freeze_backbone = FLAGS.freeze_backbone
 
@@ -48,9 +139,56 @@ def backbone_network(images, backbone_arch, reuse):
                                            spatial_squeeze=False,
                                            reuse=reuse)
         vars_to_restore = slim.get_variables_to_restore()
-        # vgg_16_vars_to_restore = list(set(vgg_16_vars_to_restore)-set(inceptioin_vars_to_restore))
 
     return backbone_network, vars_to_restore
+
+def shortcut_network(images):
+    """Create a shortcut directly from input.  The input was scaled down 32 times."""
+
+    def inception_unit(net, scale=2, count=0):
+        if not hasattr(shortcut_network, "_count"):
+            shortcut_network._count = 0
+        shortcut_network._count += 1
+        with slim.arg_scope(
+                [slim.conv2d, slim.max_pool2d],
+                stride=1, padding='SAME'):
+            with slim.arg_scope(
+                    [slim.conv2d],
+                    activation_fn=tf.nn.relu,
+                    weights_initializer=trunc_normal(0.01),
+                    normalizer_fn=slim.batch_norm,
+                    normalizer_params={
+                        'is_training': True,
+                        'decay':0.95,
+                        'epsilon': 0.001,
+                        'updates_collections': tf.GraphKeys.UPDATE_OPS,
+                        'fused': None}):
+                with tf.variable_scope("shortcut_from_images_{}".format(shortcut_network._count)):
+                    net = slim.conv2d(net, 16, [3,3], scope='conv2d_0')
+                    net = slim.conv2d(net, 16, [3,3], stride=scale, scope='scope_2')
+                    return net
+
+                    with tf.variable_scope("Branch_0"):
+                        branch_0 = slim.conv2d(net, 32, [1, 1], scope='Conv2d_0a_1x1')
+                    with tf.variable_scope("Branch_1"):
+                        branch_1 = slim.conv2d(net, 16, [1, 1], stride=1, scope='Conv2d_0a_1x1')
+                        branch_1 = slim.conv2d(branch_1, 32, [3, 3], scope='Conv2d_0b_3x3')
+                    # with tf.variable_scope("Branch_2"):
+                        # branch_2 = slim.conv2d(net, 16, [1, 1], stride=1, scope='Conv2d_0a_1x1')
+                        # branch_2 = slim.conv2d(branch_2, 32, [5, 5], scope='Conv2d_0b_3x3')
+                    with tf.variable_scope("Branch_3"):
+                        branch_3 = slim.max_pool2d(net, [3, 3], scope='MaxPool_0a_3x3')
+                    net = tf.concat(
+                            axis=3, values=[branch_0,
+                                            branch_1,
+                                            #branch_2,
+                                            branch_3])
+        return net
+    # -- END --
+    net = inception_unit(images, scale=4)
+    net = inception_unit(net, scale=4)
+    net = inception_unit(net, scale=2)
+    return net
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
@@ -76,10 +214,12 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
     """
 
     backbone, vars_to_restore = backbone_network(images, backbone_arch, reuse=reuse)
+    shortcut_from_input = shortcut_network(images)
 
     with slim.arg_scope([slim.conv2d],
+                        stride=1, padding='SAME',
                         weights_initializer=trunc_normal(0.01),
-                        activation_fn=tf.nn.sigmoid,
+                        activation_fn=tf.nn.relu,
                         normalizer_fn=slim.batch_norm,
                         normalizer_params={
                             'is_training': True,
@@ -88,60 +228,24 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
                             'updates_collections': tf.GraphKeys.UPDATE_OPS,
                             'fused': None}):
 
-        backbone = slim.conv2d(backbone, 2048, [2,2], scope='backbone_refined')
+        backbone = slim.conv2d(backbone, 1024, [3,3], scope='backbone_refined_0')
+        backbone = slim.conv2d(backbone, 1024, [3,3], scope='backbone_refined_1')
+        # backbone = slim.conv2d(backbone, 2048, [3,3], scope='backbone_refined_1')
+        #backbone = tf.concat(
+        #            axis=3,
+        #            values=[backbone, shortcut_from_input],
+        #            name="backbone_shortcut")
 
-        # Follow the number of output in YOLOv3
-        # Use sigmoid the constraint output to [0, 1]
-        net = slim.conv2d(
-                backbone,
-                num_of_anchor_boxes * (5 + num_of_classes),
-                [1, 1],
-                scope="Final_output"
-            )
+        with slim.arg_scope([slim.conv2d], weights_initializer=random_normal(0.1)):
+            net = slim.conv2d(
+                    backbone,
+                    num_of_anchor_boxes * (5 + num_of_classes),
+                    [1, 1],
+                    scope="final_output"
+                )
+
+    net = py_fit_anchor_boxes(net, num_of_anchor_boxes, num_of_classes)
     return net, vars_to_restore
-
-#    with slim.arg_scope([slim.conv2d],
-#                        weights_initializer=trunc_normal(0.01),
-#                        normalizer_fn=slim.batch_norm,
-#                        normalizer_params={
-#                            'is_training': True,
-#                            'decay':0.95,
-#                            'epsilon': 0.001,
-#                            'updates_collections': tf.GraphKeys.UPDATE_OPS,
-#                            'fused': None}):
-#        with slim.arg_scope([slim.conv2d, slim.max_pool2d],
-#                             stride=1, padding='SAME'):
-#            with tf.variable_scope("extra_inception_module_0", reuse=reuse):
-#                with tf.variable_scope("Branch_0"):
-#                    branch_0 = slim.conv2d(net, 32, [1, 1], scope='Conv2d_0a_1x1')
-#                with tf.variable_scope("Branch_1"):
-#                    branch_1 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
-#                    branch_1 = slim.conv2d(branch_1, 32, [3, 3], scope='Conv2d_0b_3x3')
-#                with tf.variable_scope("Branch_2"):
-#                    branch_2 = slim.conv2d(net, 16, [1, 1], scope='Conv2d_0a_1x1')
-#                    branch_2 = slim.conv2d(branch_2, 32, [5, 5], scope='Conv2d_0b_3x3')
-#                with tf.variable_scope("Branch_3"):
-#                    branch_3 = slim.max_pool2d(net, [3, 3], scope='MaxPool_0a_3x3')
-#                    branch_3 = slim.conv2d(branch_3, 64, [1, 1], scope='Conv2d_0b_1x1')
-#
-#                net = tf.concat(axis=3, values=[branch_0, branch_1, branch_2, branch_3])
-#
-#                # `inception_net' has 1024 channels and `net' has 160 channels.
-#                #
-#                # TODO: in the original paper, it is not directly added together.
-#                # Instead, `inception_net' should be at least x times the size
-#                # of `net' such that we can "pool concat" them.
-#                net = tf.concat(axis=3, values=[inception_net, net])
-#
-#                # Follow the number of output in YOLOv3
-#                # Use sigmoid the constraint output to [0, 1]
-#                with slim.arg_scope([slim.conv2d], activation_fn=tf.nn.sigmoid):
-#                    net = slim.conv2d(
-#                            net,
-#                            num_of_anchor_boxes * (5 + num_of_classes),
-#                            [1, 1],
-#                            scope="Final_output"
-#                        )
 
     # tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
     # tf.summary.histogram("all_bias", tf.contrib.layers.summarize_collection(tf.GraphKeys.BIASES))
@@ -152,6 +256,40 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
     # NOTE all the values output in `net` are relative to the cell size, not the
     # whole image
     # return net, vars_to_restore
+
+def cal_iou(coor1, coor2):
+    """Calculate iou of two boxes coor1 & coor2,
+       which contain [x, y, w, h]
+    """
+    assert len(coor1)==4 and len(coor2)==4, \
+            "len(coor2/coor2) != 4"
+    w2 = (coor1[2]+coor2[2])/2.0
+    max_x = max(coor1[0], coor2[0])
+    min_x = min(coor1[0], coor2[0])
+    h2 = (coor1[3]+coor2[3])/2.0
+    max_y = max(coor1[1], coor2[1])
+    min_y = min(coor1[1], coor2[1])
+    x_distance = max(0, w2-(max_x-min_x))
+    y_distance = max(0, h2-(max_y-min_y))
+    inner_area = x_distance * y_distance
+
+    box1_area = coor1[2] * coor1[3]
+    box2_area = coor2[2] * coor2[3]
+    union = box1_area + box2_area
+
+    return inner_area / (union+0.001)
+
+def max_iou_with_op_boxes(gbox, op_boxes):
+    """Get idx of the obox which has the max iou with @gbox"""
+    gbox_coord = gbox[1:]
+    max_iou = 0.0
+    max_iou_idx = 0
+    for idx, obox in enumerate(op_boxes):
+        obox_coord = obox[0:4]
+        iou = cal_iou(gbox_coord, obox_coord)
+        if iou >= max_iou:
+            max_iou_idx = idx
+    return max_iou_idx
 
 class YOLOLoss():
     """ Provides methods for calculating loss """
@@ -172,167 +310,81 @@ class YOLOLoss():
         self.num_of_gt_bnx_per_cell = num_of_gt_bnx_per_cell
         self.global_step = global_step
 
-    @staticmethod
-    def sigmoid(x):
-        return math.exp(-np.logaddexp(0, -x))
-        # return 1 / (1 + math.exp(-x))
-
-    @staticmethod
-    def bbox_iou_corner_xy(bboxes1, bboxes2):
-        """
-        Args:
-          bboxes1: shape (total_bboxes1, 4)
-              with x1, y1, x2, y2 point order.
-          bboxes2: shape (total_bboxes2, 4)
-              with x1, y1, x2, y2 point order.
-
-            p1 *-----
-               |     |
-               |_____* p2
-
-        Returns:
-            Tensor with shape (total_bboxes1, total_bboxes2)
-            with the IoU (intersection over union) of bboxes1[i] and
-            bboxes2[j] in [i, j].
-        """
-
-        x11, y11, x12, y12 = tf.split(bboxes1, 4, axis=2)
-        x21, y21, x22, y22 = tf.split(bboxes2, 4, axis=2)
-
-        xI1 = tf.maximum(x11, tf.transpose(x21))
-        xI2 = tf.minimum(x12, tf.transpose(x22))
-
-        yI1 = tf.minimum(y11, tf.transpose(y21))
-        yI2 = tf.maximum(y12, tf.transpose(y22))
-
-        inter_area = tf.maximum((xI2 - xI1), 0) * tf.maximum((yI1 - yI2), 0)
-
-        bboxes1_area = (x12 - x11) * (y11 - y12)
-        bboxes2_area = (x22 - x21) * (y21 - y22)
-
-        union = (bboxes1_area + tf.transpose(bboxes2_area)) - inter_area
-
-        return inter_area / (union+0.0001)
-
-    @staticmethod
-    def bbox_iou_center_xy_batch(bboxes1, bboxes2):
-        """ Same as `bbox_overlap_iou_v1', except that:
-
-          1. it use center_x, center_y, w, h instead of x1, y1, x2, y2.
-          2. it operate on a batch rather than a piece of batch, and it
-             retains the batch structure (i.e., it operate piece-wise
-             level between batches)! This is IMPORTANT. It means that
-             we will do bbox_iou_center_xy_single() with piece 1 of
-             bboxes1 against piece 1 of bboxes2, and piece 2 of bboxes1
-             against piece 2 of bboxes2, but never piece 1 of bboxes1
-             against piece 2 of bboxes2.
-
-          Args:
-            bboxes1: [batch_size, d21, 4].
-            bboxes2: [batch_size, d22, 4].
-
-          Return:
-             [batch_size, d21, d22, 1]
-        """
-
-        x11, y11, w11, h11 = tf.split(bboxes1, 4, axis=2)
-        x21, y21, w21, h21 = tf.split(bboxes2, 4, axis=2)
-
-        xi1 = tf.maximum(x11, tf.transpose(x21, perm=[0,2,1]))
-        xi2 = tf.minimum(x11, tf.transpose(x21, perm=[0,2,1]))
-
-        yi1 = tf.maximum(y11, tf.transpose(y21, perm=[0,2,1]))
-        yi2 = tf.minimum(y11, tf.transpose(y21, perm=[0,2,1]))
-
-        wi = w11/2.0 + tf.transpose(w21/2.0, perm=[0,2,1])
-        hi = h11/2.0 + tf.transpose(h21/2.0, perm=[0,2,1])
-
-        inter_area = tf.maximum(wi - (xi1 - xi2), 0) \
-                      * tf.maximum(hi - (yi1 - yi2), 0)
-
-        bboxes1_area = w11 * h11
-        bboxes2_area = w21 * h21
-
-        union = (bboxes1_area
-                 + tf.transpose(bboxes2_area, perm=[0,2,1])) - inter_area
-
-        # some invalid boxes should have iou of 0 instead of NaN
-        # If inter_area is 0, then this result will be 0; if inter_area is
-        # not 0, then union is not too, therefore adding a epsilon is OK.
-        return inter_area / (union+0.0001)
-
-    def concat_tranpose_broadcast_batch(self, gt_boxes_padded, op_boxes):
-        """ A concat operation with broadcasting semantic. NOTE that it also
-            operates on batch level and retains the batch structure, as
-            described in `bbox_iou_center_xy_batch()` above.
-
-            Args:
-              gt_boxes_padded: [-1, num_of_gt_bnx_per_cell, 5+num_of_classes].
-              op_boxes: [-1, num_of_anchor_boxes, 5+num_of_classes].
-
-            Return:
-              [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
-        """
-        num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
-        num_of_anchor_boxes = self.num_of_anchor_boxes
-        num_of_classes = self.num_of_classes
-
-        gt_tile = tf.tile(gt_boxes_padded, [1,1,num_of_anchor_boxes])
-        gt_reshape = tf.reshape(
-                        gt_tile,
-                        [-1, num_of_anchor_boxes * num_of_gt_bnx_per_cell, 5+num_of_classes]
-                    )
-
-        op_tile = tf.tile(op_boxes, [1, num_of_gt_bnx_per_cell, 1])
-        gt_op = tf.concat([gt_reshape, op_tile], axis=-1)
-        return tf.reshape(
-              gt_op,
-              [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
-            )
-
-    def bbox_iou_center_xy_pad_original(self, gt_boxes, op_boxes):
-        """ Concat gt_boxes and op_boxes with broadcasting semantic, as shown
-            in `concat_tranpose_broadcast_batch()', and finally concat the
-            corresponding `ious` **at the beginning**.
-
-          Args:
-           gt_boxes: [-1, num_of_gt_bnx_per_cell, 5]
-           op_boxes: [-1, num_of_anchor_boxes, 5+num_of_classes]
-
-          Return:
-            bundle: [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 3, 5+num_of_classes],
-                    with
-                    [:, :, :, 0, 0] the iou, and [:, :, :, 0, :] padded to 5+num_of_classes
-                    [:, :, :, 1, :] the ground_truth, padded to 5+num_of_classes
-                    [:, :, :, 2, :] the output
+    # use tf.py_func to iterate into it
+    def py_cal_loss(self, ts):
+        """ ts of shape
+            [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
         """
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
-        ious = YOLOLoss.bbox_iou_center_xy_batch(
-                            gt_boxes[:, :, 1:5],
-                            op_boxes[:, :, 0:4]
-                          )
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1]
-        ious_1 = tf.expand_dims(ious_0, axis=-1)
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 5+num_of_classes]
-        ious_paddings = [[0,0], [0,0], [0,0], [0, num_of_classes+4]]
-        ious_2 = tf.pad(ious_1, ious_paddings)
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 1, 5+num_of_classes]
-        ious = tf.expand_dims(ious_2, -2)
+        def py_cal_loss_onecell(cell):
+            """ cell of shape
+                [num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
+            """
+            split_num = num_of_anchor_boxes*(5+num_of_classes)
+            op_boxes = np.reshape(
+                           cell[0:split_num],
+                           [num_of_anchor_boxes, 5+num_of_classes]
+                       )
+            gt_boxes = np.reshape(
+                           cell[split_num:],
+                           [num_of_gt_bnx_per_cell, 5]
+                       )
+            max_oboxes = set()
+            gt_op_matched_pairs = []
+            for g_idx, gbox in enumerate(gt_boxes):
+                if not np.any(gbox): #fake gt box
+                    continue
+                o_idx = max_iou_with_op_boxes(gbox, op_boxes)
+                max_oboxes.add(o_idx)
+                gt_op_matched_pairs.append( (g_idx, o_idx) )
+            # calculate coordinate loss & objectness confidence loss
+            coor_loss = 0.0
+            objectness_loss = 0.0
+            for tp in gt_op_matched_pairs:
+                g_idx = tp[0]
+                o_idx = tp[1]
+                gbox_coord = gt_boxes[g_idx][1:]
+                obox_coord = op_boxes[o_idx][0:4]
+                coor_loss += (math.pow(gbox_coord[0] - obox_coord[0], 2) +
+                              math.pow(gbox_coord[1] - obox_coord[1], 2) +
+                              math.pow(math.sqrt(gbox_coord[2]) - math.sqrt(obox_coord[2]), 2) +
+                              math.pow(math.sqrt(gbox_coord[3]) - math.sqrt(obox_coord[3]), 2))
+                obox_obj = op_boxes[o_idx][4]
+                # print("###########################obox_obj before cal loss: " + str(obox_obj))
+                # iou = cal_iou(gbox_coord, obox_coord)
+                # objectness_loss += math.pow(obox_obj-iou, 2)
+                objectness_loss += math.pow(obox_obj - 1, 2)
 
-        # [-1, num_of_gt_bnx_per_cell, 5+num_of_classes]
-        gt_paddings = [[0,0], [0,0], [0, num_of_classes]]
-        gt_boxes_padded = tf.pad(gt_boxes, paddings=gt_paddings)
+            # calculate noobjectness confidence loss
+            noobjectness_loss = 0.0
+            all_op_idx = set(range(len(op_boxes)))
+            for o_idx in all_op_idx-max_oboxes:
+                obox_obj = op_boxes[o_idx][4]
+                noobjectness_loss += math.pow(obox_obj, 2)
 
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes, 2, 5+num_of_classes]
-        op_gt_bundle = self.concat_tranpose_broadcast_batch(
-                        gt_boxes_padded,
-                        op_boxes
-                    )
-        bundle = tf.concat([ious, op_gt_bundle], -2)
-        return bundle
+            # calculate classness loss (TODO)
+
+            loss = 0.5 * coor_loss + 10 * objectness_loss + 0.5 * noobjectness_loss
+            return np.float32(loss)
+        # ----- END DEF py_cal_loss_onecell ----
+
+        total_loss = np.float32(0.0)
+        # Docs say `ts' is not guaranteed to be a copy,
+        # so we make a deepcopy here.
+        # ts = copy.deepcopy(ts)
+        for cell in ts:
+            total_loss += py_cal_loss_onecell(cell)
+        return total_loss
+
+    @staticmethod
+    def _py_func_identity_grad(op, grad):
+        # we are passing gradient from the last output (the loss) of this
+        # network, which is 1. (Uncomment the line above to see the output)
+        # return tf.ones_like(op.inputs[0]) * grad
+        return op.inputs[0] * grad
 
     def calculate_loss(self, output, ground_truth):
         """ Calculate loss using the loss from yolov1 + yolov2.
@@ -356,128 +408,26 @@ class YOLOLoss():
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
 
-        # shape of output:
-        #   [?, ?, ?, num_of_anchor_boxes * (5 + num_of_classes))
-        # shape of ground_truth:
-        #   [?, ?, ?, 5 * num_of_gt_bnx_per_cell]
-
         # concat ground_truth and output to make a tensor of shape 
         #   (?, ?, ?, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell)
         output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
                                             name="output_and_ground_truth_concat")
-
         # flatten dimension
         op_and_gt_batch = \
             tf.reshape(
                 output_and_ground_truth,
                 [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
             )
-
-        split_num = num_of_anchor_boxes*(5+num_of_classes)
-        op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
-                              [-1, num_of_anchor_boxes, 5+num_of_classes])
-        gt_boxes = tf.reshape(op_and_gt_batch[..., split_num:],
-                              [-1, num_of_gt_bnx_per_cell, 5])
-        # There are many some fake ground truth (i.e., [0,0,0,0,0]) in gt_boxes, 
-        # but we can't naively remove it here. Instead, we use tf.ceil() below
-        # to calculate loss. That way, if it is a fake gt box with [0,0,0,0,0]
-        # tf.ceil() will return 0, doing no harm.
-        #
-        # Note that to make it "no harm", a real gt box should contain coordinates
-        # < 1 such that tf.ceil() return 1.
-
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
-        ious = YOLOLoss.bbox_iou_center_xy_batch(
-                                gt_boxes[:, :, 1:5],
-                                op_boxes[:, :, 0:4]
+        with tf.name_scope("pyfunc", "MyLoss", [op_and_gt_batch]):
+            rnd_name = 'PyFuncGrad' + str(np.random.randint(0, 1E+8))
+            tf.RegisterGradient(rnd_name)(YOLOLoss._py_func_identity_grad)
+            default_graph = tf.get_default_graph()
+            with default_graph.gradient_override_map({"PyFunc": rnd_name}):
+                loss_out = tf.py_func(
+                               self.py_cal_loss,
+                               [op_and_gt_batch],
+                               [tf.float32],
+                               stateful=True,
+                               name="pyfunction"
                             )
-        # [-1, num_of_gt_bnx_per_cell, 1]
-        top_values, idx = tf.nn.top_k(ious, k=1)
-        # [-1, num_of_gt_bnx_per_cell] (squeeze the last dimension)
-        idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
-
-        # Get tuples of (gt, op) with the max iou (i.e., those who match)
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
-        one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
-
-        # (?, 3), something like
-        #    [[0,1,2],
-        #     [0,2,2],
-        #     [0,3,0],
-        #     [1,1,2],
-        #     [1,2,2]]
-        # across batches.
-        full_idx = tf.where(tf.equal(1.0, one_hot_idx))
-        gt_idx = full_idx[:, 0:2]
-        op_idx = full_idx[:, 0:3:2]
-        # [?, 5]
-        gt_boxes_max = tf.gather_nd(gt_boxes, gt_idx)
-        # [?, 5+num_of_classes]
-        op_boxes_max = tf.gather_nd(op_boxes, op_idx)
-        # [?, 5+num_of_classes + 5]
-        # NOTE the order in which they are concatenated!
-        iou_max_boxes = tf.concat([op_boxes_max, gt_boxes_max], axis=1)
-
-        # Get those op boxes which were never matched by any gt box
-        mask = tf.reduce_max(one_hot_idx, axis=-2)
-        op_never_max_indices = tf.where(tf.equal(0.0, mask))
-        never_max_op_boxes = tf.gather_nd(op_boxes, op_never_max_indices)
-
-        #coordinate loss
-        _5_nc = 5+num_of_classes
-        cooridniates_se_wh = tf.sqrt(
-            tf.pow(iou_max_boxes[:, 2:4]-iou_max_boxes[:, _5_nc+3:_5_nc+5], 2)+0.0001
-        )
-        cooridniates_se_xy = tf.pow(iou_max_boxes[:, 0:2]-iou_max_boxes[:, _5_nc+1:_5_nc+3], 2)
-        cooridniates_se = tf.concat([cooridniates_se_xy, cooridniates_se_wh], axis=-1)
-        cooridniates_se_ceil = tf.ceil(iou_max_boxes[:, _5_nc+1:])
-        cooridniates_se_real_gt = cooridniates_se * cooridniates_se_ceil
-        cooridniates_loss = tf.reduce_sum(cooridniates_se_real_gt)
-
-        # objectness loss
-        #
-        objectness_se = tf.pow(iou_max_boxes[:, 4]-1, 2)
-        objectness_se_ceil = tf.ceil(iou_max_boxes[:, _5_nc+2])
-        objectness_se_real_gt = objectness_se * objectness_se_ceil
-        objectness_loss = tf.reduce_sum(objectness_se_real_gt)
-
-        def unique_with_ori_index(x):
-            res = tf.cumsum(tf.pad(tf.unique_with_counts(x)[2],[[1,0]]))[:-1]
-            return res
-        where = tf.where(tf.equal(0.0, objectness_se_ceil))
-        # mis_included_non_match_boxes = tf.gather_nd(iou_max_boxes[:, 4:5], where)
-        # mis_included_non_objectness = tf.pow(mis_included_non_objectness[:, 0]-0, 2)
-        mis_included_full_idx = tf.gather_nd(full_idx, where)
-        mis_included_full_idx_idx = unique_with_ori_index(mis_included_full_idx[:, 0])
-        mis_included_full_idx_idx = tf.reshape(mis_included_full_idx_idx, [-1, 1])
-        unique_full_idx = tf.gather_nd(full_idx, mis_included_full_idx_idx)
-        mis_included_op_boxes_idx = unique_full_idx[:, 0:3:2]
-        mis_included_op_boxes = tf.gather_nd(op_boxes, mis_included_op_boxes_idx)
-        mis_included_non_objectness = tf.pow(mis_included_op_boxes[:, 4]-0, 2)
-        mis_included_non_objectness = tf.reduce_sum(mis_included_non_objectness)
-
-        # usually some fake gt boxes will consume a single anchor box (index 0) which
-        # should contain non-object. So here we calculate the number of
-        # mis-count for that mis-included-should-be-not-matched boxes.
-#        top_values_flat = tf.cast(tf.reshape(top_values, [-1, 1]), tf.int64)
-#        full_idx_with_values = tf.concat([full_idx[:, 0:1], top_values_flat], axis=-1)
-#        part = parts[:, 1]
-#        where = tf.where(tf.equal(tf.constant(0, dtype=tf.int64), part))
-#        gather_nd = tf.gather_nd(op_idx, where)
-#        gather_plus = gather_nd[:, 0] + gather_nd[:, 1]
-#        unique_values, _ = tf.unique(gather_plus)
-#        miscount = tf.shape(unique_values)[0]
-
-        never_max_loss = tf.reduce_sum(tf.pow(never_max_op_boxes[:, 4]-0, 2))
-        non_objectness_loss = never_max_loss #+ mis_included_non_objectness
-
-        # objectness_loss = tf.Print(objectness_loss, [cooridniates_loss, objectness_loss, non_objectness_loss], "cl, ol, nol: ", summarize=100000)
-
-        #classness loss (TODO)
-
-        # with tf.control_dependencies([assert_op]):
-        with tf.variable_scope("calculate_loss_inner_scope"):
-            loss = (cooridniates_loss +
-                    5*objectness_loss) #+
-                    #0.5*non_objectness_loss)
-        return loss
+        return loss_out[0]
