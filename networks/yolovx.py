@@ -81,7 +81,7 @@ def shortcut_from_input(images):
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
 def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
-           freeze_backbone, reuse=tf.AUTO_REUSE):
+           freeze_backbone=True, reuse=tf.AUTO_REUSE):
     """ This architecture of YOLO is not strictly the same as in those papers.
     We use some backbone networks as a starting point, and then add necessary
     layers on top of it. Therefore, we name it `YOLOvx (version x)`.

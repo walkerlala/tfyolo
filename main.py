@@ -5,8 +5,10 @@ import datetime
 import os
 import pdb
 import sys
+import cv2
 import tensorflow as tf
 from utils.dataset import DatasetReader
+from utils.dataset import ImageHandler
 from networks.yolovx import YOLOvx
 from networks.yolovx import YOLOLoss
 from tensorflow.python.ops import control_flow_ops
@@ -14,7 +16,14 @@ from tensorflow.python.ops import control_flow_ops
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
-tf.app.flags.DEFINE_boolean("is_training", True, "To train or not to train.")
+tf.app.flags.DEFINE_boolean("train", False, "To train or not to train.")
+tf.app.flags.DEFINE_boolean("test", False, "To test or not to test.")
+tf.app.flags.DEFINE_boolean("multiple_images", False, "Predict for multiple images.")
+
+tf.app.flags.DEFINE_string("infile", "Image.jpg", "The image to predict.")
+tf.app.flags.DEFINE_alias("files_list", "infile")
+tf.app.flags.DEFINE_string("outfile", "Prediction.jpg", "Output path of the predictions.")
+tf.app.flags.DEFINE_alias("outdir", "outfile")
 
 tf.app.flags.DEFINE_boolean("freeze_backbone", False,
         "Freeze the backbone network or not")
@@ -28,6 +37,7 @@ tf.app.flags.DEFINE_boolean("restore_all_variables", False,
         "means restore only variables for the backbone network")
 tf.app.flags.DEFINE_string("backbone_arch", "vgg_16",
         "Avaliable backbone architecture are 'vgg_16' and 'inception_v1'")
+tf.app.flags.DEFINE_alias("backbone", "backbone_arch")
 
 tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolo_train_dir",
         "Path to save checkpoints")
@@ -288,6 +298,9 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
         result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
         return result
 
+def build_images_with_bboxes(*args, **kwargs):
+    return validation(*args, **kwargs)
+
 def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell):
     """Put ground truth boxes on images.
 
@@ -361,28 +374,9 @@ def fit_anchor_boxes(output, num_of_anchor_boxes, anchors):
 def train():
     """ Train the YOLOvx network. """
 
-    training_file_list = FLAGS.training_file_list
-    class_name_file = FLAGS.class_name_file
-    starter_learning_rate = FLAGS.starter_learning_rate
-    batch_size = FLAGS.batch_size
-    num_of_image_scales = FLAGS.num_of_image_scales
-    image_size_min = FLAGS.image_size_min
-    num_of_classes = FLAGS.num_of_classes
-    num_of_anchor_boxes = FLAGS.num_of_anchor_boxes
-    num_of_gt_bnx_per_cell = FLAGS.num_of_gt_bnx_per_cell
-    num_of_steps = FLAGS.num_of_steps
-    checkpoint = FLAGS.checkpoint
-    restore_all_variables = FLAGS.restore_all_variables
-    train_ckpt_dir = FLAGS.train_ckpt_dir
-    train_log_dir = FLAGS.train_log_dir
-    backbone_arch = FLAGS.backbone_arch
-    freeze_backbone = FLAGS.freeze_backbone
-    infer_threshold = FLAGS.infer_threshold
-    summary_steps = FLAGS.summary_steps
-
     variable_sizes = []
-    for i in range(num_of_image_scales):
-        variable_sizes.append(image_size_min + i*32)
+    for i in range(FLAGS.num_of_image_scales):
+        variable_sizes.append(FLAGS.image_size_min + i*32)
 
     tf.logging.info("Building tensorflow graph...")
 
@@ -390,17 +384,22 @@ def train():
     # Because we have variable size of input, w/h of image are both None (but
     # note that they will eventually have a shape)
     _x = tf.placeholder(tf.float32, [None, None, None, 3])
-    _y, vars_to_restore = YOLOvx(_x,
-                                 backbone_arch=backbone_arch,
-                                 num_of_anchor_boxes=num_of_anchor_boxes,
-                                 num_of_classes=num_of_classes,
-                                 freeze_backbone=freeze_backbone,
-                                 reuse=tf.AUTO_REUSE)
+    _y, vars_to_restore = YOLOvx(
+                            _x,
+                            backbone_arch=FLAGS.backbone_arch,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes,
+                            freeze_backbone=FLAGS.freeze_backbone,
+                            reuse=tf.AUTO_REUSE
+                          )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    _y = fit_anchor_boxes(_y, num_of_anchor_boxes, anchors)
+    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
 
-    _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
+    _y_gt = tf.placeholder(
+                tf.float32,
+                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+            )
 
     global_step = tf.Variable(0, name='self_global_step',
                               trainable=False, dtype=tf.int32)
@@ -412,10 +411,10 @@ def train():
     all_vars.append(global_step)
 
     losscal = YOLOLoss(
-                  batch_size=batch_size,
-                  num_of_anchor_boxes=num_of_anchor_boxes,
-                  num_of_classes=num_of_classes,
-                  num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell,
+                  batch_size=FLAGS.batch_size,
+                  num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                  num_of_classes=FLAGS.num_of_classes,
+                  num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
                   global_step=global_step
                 )
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
@@ -429,7 +428,7 @@ def train():
 #            decay_rate=0.95,
 #            staircase=True
 #        )
-    learning_rate = starter_learning_rate
+    learning_rate = FLAGS.starter_learning_rate
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
 
@@ -441,28 +440,37 @@ def train():
     # scale x/y coordinates of output of the neural network to be relative of
     # the whole image.
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
-    y_scaled = scale_output(_y, output_scale_placeholder,
-                                 num_of_anchor_boxes=num_of_anchor_boxes,
-                                 num_of_classes=num_of_classes)
-    validation_images = validation(output=y_scaled, images=_x,
-                                   num_of_anchor_boxes=num_of_anchor_boxes,
-                                   num_of_classes=num_of_classes,
-                                   infer_threshold=infer_threshold)
+    y_scaled = scale_output(
+                    _y,
+                    output_scale_placeholder,
+                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                    num_of_classes=FLASG.num_of_classes
+               )
+    validation_images = validation(
+                            output=y_scaled,
+                            images=_x,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes,
+                            infer_threshold=FLAGS.infer_threshold
+                        )
     tf.summary.image("images_validation", validation_images, max_outputs=3)
 
-    gt_scaled = scale_ground_truth(_y_gt, output_scale_placeholder,
-                                   num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell)
+    gt_scaled = scale_ground_truth(
+                    _y_gt,
+                    output_scale_placeholder,
+                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
+                )
     images_with_grouth_boxes = build_images_with_ground_truth(
                                     _x,
                                     gt_scaled,
-                                    num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
                                 )
     tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
     tf.logging.info("All network loss/train_step built! Yah!")
 
     # load images and labels
-    reader = DatasetReader(training_file_list, class_name_file)
+    reader = DatasetReader(FLAGS.training_file_list, FLAGS.class_name_file)
 
     initializer = tf.global_variables_initializer()
 
@@ -471,26 +479,26 @@ def train():
                                             log_device_placement=False))
 
     merged_summary = tf.summary.merge_all()
-    if not os.path.exists(train_log_dir):
-        os.makedirs(train_log_dir)
-    elif not os.path.isdir(train_log_dir):
-        print("{} already exists and is not a dir. Exit.".format(train_log_dir))
+    if not os.path.exists(FLAGS.train_log_dir):
+        os.makedirs(FLAGS.train_log_dir)
+    elif not os.path.isdir(FLAGS.train_log_dir):
+        print("{} already exists and is not a dir. Exit.".format(FLAGS.train_log_dir))
         exit(1)
-    train_writer = tf.summary.FileWriter(train_log_dir, sess.graph)
+    train_writer = tf.summary.FileWriter(FLAGS.train_log_dir, sess.graph)
 
     sess.run(initializer)
 
-    if restore_all_variables:
+    if FLAGS.restore_all_variables:
         restorer = tf.train.Saver(all_vars)
     else:
         restorer = tf.train.Saver(vars_to_restore)
-    restorer = restorer.restore(sess, checkpoint)
+    restorer = restorer.restore(sess, FLAGS.checkpoint)
     tf.logging.info("checkpoint restored!")
     # value of `global_step' is restored as well
     saver = tf.train.Saver(all_vars)
 
     idx = sess.run(global_step)
-    while idx != num_of_steps:
+    while idx != FLAGS.num_of_steps:
         # Change size every 100 steps.
         # `size' is the size of input image, not the final feature map size.
         image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
@@ -498,10 +506,9 @@ def train():
             print("Switching to another image size: %d" % image_size)
 
         batch_xs, batch_ys, outscale = reader.next_batch(
-                            batch_size=batch_size,
+                            batch_size=FLAGS.batch_size,
                             image_size=image_size,
-                            num_of_anchor_boxes=num_of_anchor_boxes,
-                            num_of_gt_bnx_per_cell=num_of_gt_bnx_per_cell
+                            num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
                         )
 
         sys.stdout.write("Running train_step[{}]...".format(idx))
@@ -518,7 +525,7 @@ def train():
                 # run_metadata=run_metadata,
             )
         # validate per `summary_steps' iterations
-        if idx % summary_steps == 0:
+        if idx % FLAGS.summary_steps == 0:
             train_writer.add_summary(train_summary, idx)
 
         elapsed_time = datetime.datetime.now() - start_time
@@ -529,20 +536,118 @@ def train():
         # NOTE by now, global_step is always == idx+1, because we have do
         # `train_step`...
         if (idx+1) % 500  == 0:
-            ckpt_name = os.path.join(train_ckpt_dir, "model.ckpt")
-            if not os.path.exists(train_ckpt_dir):
-                os.makedirs(train_ckpt_dir)
-            elif not os.path.isdir(train_ckpt_dir):
-                print("{} is not a directory.".format(train_ckpt_dir))
+            ckpt_name = os.path.join(FLAGS.train_ckpt_dir, "model.ckpt")
+            if not os.path.exists(FLAGS.train_ckpt_dir):
+                os.makedirs(FLAGS.train_ckpt_dir)
+            elif not os.path.isdir(FLAGS.train_ckpt_dir):
+                print("{} is not a directory.".format(FLAGS.train_ckpt_dir))
                 return -1
             saver.save(sess, ckpt_name, global_step=global_step)
 
         idx += 1
 
+def test():
+    """Test the YOLOvx network"""
+
+    tf.logging.info("Building tensorflow graph...")
+
+    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    _y, vars_to_restore = YOLOvx(
+                            _x,
+                            backbone_arch=FLAGS.backbone_arch,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes
+                          )
+    # TODO should not be hard-coded.
+    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+
+    output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
+    y_scaled = scale_output(
+                    _y,
+                    output_scale_placeholder,
+                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                    num_of_classes=FLAGS.num_of_classes
+               )
+    images_with_bboxes = build_images_with_bboxes(
+                            output=y_scaled,
+                            images=_x,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes,
+                            infer_threshold=FLAGS.infer_threshold
+                         )
+    global_step = tf.Variable(0, name='self_global_step',
+                              trainable=False, dtype=tf.int32)
+
+    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    all_vars.extend(vars_to_restore)
+    all_vars = list(set(all_vars))
+    all_vars.append(global_step)
+    tf.logging.info("All network loss/train_step built! Yah!")
+
+    image_handler = ImageHandler(FLAGS.multiple_images, FLAGS.infile)
+
+    initializer = tf.global_variables_initializer()
+
+    if FLAGS.multiple_images:
+        if not os.path.exists(FLAGS.outdir):
+            os.makedirs(FLAGS.outdir)
+
+    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
+                                            log_device_placement=False))
+    sess.run(initializer)
+
+    restorer = tf.train.Saver(all_vars)
+    restorer = restorer.restore(sess, FLAGS.checkpoint)
+    tf.logging.info("checkpoint restored!")
+
+    idx = 1
+    while True:
+        (batch_xs, batch_xs_scale_info,
+            batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+        if not len(batch_xs): break
+        sys.stdout.write("Testing batch[{}]...".format(idx))
+        idx += 1
+        sys.stdout.flush()
+        start_time = datetime.datetime.now()
+        final_images = sess.run(images_with_bboxes,
+                                feed_dict={
+                                    _x: batch_xs,
+                                    output_scale_placeholder: outscale
+                                },
+                                options=run_option)
+        elapsed_time = datetime.datetime.now() - start_time
+        sys.stdout.write(
+          "Prediction time: {} | Writing images...".format(elapsed_time)
+        )
+
+        image_handler.write_batch(
+                        final_images,
+                        batch_xs_scale_info,
+                        batch_xs_names,
+                        FLAGS.multiple_images,
+                        FLAGS.outdir,
+                        FLAGS.outfile
+                      )
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
 def main(_):
 
-    tf.logging.info("yolo.py started in training mode. Starting to train...")
-    train()
+    if FLAGS.train and FLAGS.test:
+        print("ERROR: FLAGS.train & FLAGS.test are both set to True.")
+        exit()
+    if not FLAGS.train and not FLAGS.test:
+        print("ERROR: FLAGS.train & FLAGS.test are both set to False.")
+
+    if FLAGS.train:
+        tf.logging.info("Started in training mode. Starting to train...")
+        train()
+    elif FLAGS.test:
+        tf.logging.info("Started in testing mode...")
+        test()
 
 if __name__ == '__main__':
     tf.app.run()
