@@ -74,7 +74,7 @@ class DatasetReader():
 
         if not len(gt_bnxs):
             gt_bnxs = [[[] for i in range(feature_map_len)]
-                                for i in range(feature_map_len)]
+                                for j in range(feature_map_len)]
 
         gt_bnxs[cell_i][cell_j].append(box)
         return gt_bnxs
@@ -111,8 +111,7 @@ class DatasetReader():
         return outscale
 
     def next_batch(self, batch_size=50, image_size=320, num_of_anchor_boxes=5,
-                   num_of_gt_bnx_per_cell=20, normalize_image=True,
-                   shrink_coordinate_related_to_cell=True):
+                   num_of_gt_bnx_per_cell=20, normalize_image=True):
         """ Return next batch of images.
 
           Args:
@@ -122,11 +121,6 @@ class DatasetReader():
             num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
             num_of_gt_bnx_per_cell: See FLAGS.num_of_gt_bnx_per_cell.
             normalize_image: To or to not normalize the image (to [0, 1]).
-            shrink_coordinate_related_to_cell: To or not to scale the x/y
-                coordinates to be relative to their corresponding cell.
-                NOTE!! There are lots of code that assumes this to True, so
-                don't change that unless you know what you are doing here.
-                TODO
 
           Return:
             batch_xs: A batch of image, i.e., a numpy array in shape
@@ -140,6 +134,7 @@ class DatasetReader():
         batch_xs_filename = []
         for _ in range(batch_size):
             batch_xs_filename.append(self.images_queue.get())
+        random.shuffle(batch_xs_filename)
         for path in batch_xs_filename:
             self.images_queue.put(path)
         batch_ys_filename = []
@@ -162,12 +157,15 @@ class DatasetReader():
             im = cv2.resize(orignal_image, dsize=(image_size, image_size),
                             interpolation=cv2.INTER_LINEAR)
             if normalize_image:
-                # TODO I don't know what exactly the 2nd parameter for
+                # TODO I don't know what exactly is the 2nd parameter for
                 im = cv2.normalize(np.asarray(im, np.float32), np.array([]),
                                    alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
             batch_xs.append(im)
 
             yfile = open(y_path, "r")
+            # TODO uncomment this line if you DON'T want to discover file with no person
+            # gt_bnxs = [[[] for i in range(int(image_size/32))]
+                                # for j in range(int(image_size/32))]
             gt_bnxs = []
             for line in yfile:
                 line = line.strip()
@@ -197,13 +195,13 @@ class DatasetReader():
                     print("WARNING: x|y == 0, x&y: %s, y_path:%s" % (str[x, y], y_path))
 
                 cell_i, cell_j = self._get_cell_ij(x, y, image_size)
-                if shrink_coordinate_related_to_cell:
-                    x *= image_size
-                    x %= cell_size
-                    x /= cell_size
-                    y *= image_size
-                    y %= cell_size
-                    y /= cell_size
+                # adjust coordinates to be relative to their corresponding cell
+                x *= image_size
+                x %= cell_size
+                x /= cell_size
+                y *= image_size
+                y %= cell_size
+                y /= cell_size
                 box = [label, x, y, w, h]
                 gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
                 assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"

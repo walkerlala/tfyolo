@@ -34,15 +34,19 @@ tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolo_train_dir",
 tf.app.flags.DEFINE_string("train_log_dir", "/disk1/yolotraining/",
         "Path to save tfevent (for tensorboard)")
 
+tf.app.flags.DEFINE_float("starter_learning_rate", 1e-3, "Starter learning rate")
+
 tf.app.flags.DEFINE_integer("batch_size", 64, "Batch size.")
 
 tf.app.flags.DEFINE_integer("num_of_classes", 1, "Number of classes.")
 
 tf.app.flags.DEFINE_float("infer_threshold", 0.6, "Objectness threshold")
 
-# We don't do any clustering here. Just use 5 as a heuristic.
+# NOTE We don't do any clustering for this. Just use 5 as a heuristic.
 tf.app.flags.DEFINE_integer("num_of_anchor_boxes", 5,
         "Number of anchor boxes.")
+
+tf.app.flags.DEFINE_integer("summary_steps", 100, "Write summary ever X steps")
 
 # NOTE
 #   1. Lable files should be put in the same directory and in the YOLO format
@@ -61,6 +65,7 @@ tf.app.flags.DEFINE_string("training_file_list",
 #
 # Empty line and lines that start with # will be ignore.
 # (But # at the end will not. Careful!)
+# TODO we are now ignoring class information (predict only for persons)
 tf.app.flags.DEFINE_string("class_name_file", "/disk1/labeled/classnames.txt",
         "File which contains id <=> classname mapping.")
 
@@ -73,7 +78,8 @@ tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
 
 # It is pure pain to deal with tensor of variable length tensors (try and screw
 # up your life ;-). So we pack each cell with a fixed number of ground truth
-# bounding box.
+# bounding box (even though there is not that many ground truth bounding box
+# at that cell). See code at "utils/dataset.py"
 tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 20,
         "Numer of ground truth bounding box.")
 
@@ -195,24 +201,52 @@ def scale_ground_truth(ground_truth, outscale, num_of_gt_bnx_per_cell):
             [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2], -1])
     return ground_truth
 
+def non_max_suppression_single(output_piece):
+    """Perform non max suppression on a single image. """
+    # non-max suppression
+    selected_indices = tf.image.non_max_suppression(
+                        output_piece[...,0:4],
+                        output_piece[..., 4],
+                        max_output_size=10000,
+                        iou_threshold=0.5
+                    )
+    # mask non-selected box
+    one_hot = tf.one_hot(
+                selected_indices,
+                tf.shape(output_piece)[0],
+                dtype=output_piece.dtype
+              )
+    mask = tf.reduce_sum(one_hot, axis=0)
+    output_piece = output_piece * mask[..., None]
+    return output_piece
+
+def non_max_suppression_batch(output):
+    """Perform non max suppression on a batch of images
+    (not really images, but output of the neural network)."""
+    result = tf.map_fn(
+                lambda output_piece: non_max_suppression_single(output_piece),
+                output
+             )
+    return result
+
 def validation(output, images, num_of_anchor_boxes, num_of_classes,
           infer_threshold=0.6):
     """
         Args:
-         output: YOLOvx network output, shape
+         output: output of YOLOvx network, shape:
             [None, None, None, num_of_anchor_boxes * (5+num_of_classes)]
 
             Note, the x/y coordinates from the original neural network output are
             relative to the the corresponding cell. Here we expect them to be
-            already scaled to relative to the whole image.
+            already scaled to relative to the whole image (i.e., used scale_output())
 
          images: input images, shape [None, None, None, 3]
          infer_threshold: See FLAGS.infer_threshold.
-         num_of_anchor_boxes:
-         num_of_classes:
+         num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
+         num_of_classes: See FLAGS.num_of_classes.
 
         Return:
-         A copy of @images with bounding box on it.
+         result: A copy of @images with prediction bounding box on it.
     """
     with tf.variable_scope("validation_scope"):
         image_shape = tf.shape(images)
@@ -220,22 +254,21 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
         output_shape = tf.shape(output)
         output_row_num = output_shape[1]
 
-        output = tf.reshape(output, [-1, 5+num_of_classes])
-        # output_bool = tf.equal(output, tf.constant([0.0]))
-        # output_bool_sum = tf.reduce_sum(tf.cast(output_bool, tf.int32))
-        # output = tf.Print(output, [output_bool_sum], "output_bool_sum: ", summarize=10000)
+        output = tf.reshape(
+                    output,
+                    [-1, num_of_anchor_boxes*output_row_num*output_row_num, 5+num_of_classes]
+                )
 
         # get P(class) = P(object) * P(class|object)
         # p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
         # output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
 
-        # mask all the bounding boxes whose objectness value is not greater than
-        # threshold.
+        # mask all bounding boxes whose objectness values are less than threshold.
         output_idx = output[..., 4]
         mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
         mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
         masked_output = output * mask
-        # TODO now we just draw all the box, regardless of its classes.
+        # NOTE now we just draw all the box, regardless of its classes.
         boxes_x = masked_output[..., 0:1]
         boxes_y = masked_output[..., 1:2]
         boxes_w = masked_output[..., 2:3]
@@ -250,23 +283,8 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes,
                 axis=-1
             )
 
-        # non-max suppression
-        selected_indices = tf.image.non_max_suppression(
-                            output[...,0:4],
-                            output[..., 4],
-                            max_output_size=10000,
-                            iou_threshold=0.5
-                        )
-        # mask non-selected box
-        one_hot = tf.one_hot(selected_indices, tf.shape(output)[0], dtype=output.dtype)
-        mask = tf.reduce_sum(one_hot, axis=0)
-        output = output * mask[..., None]
+        output = non_max_suppression_batch(output)
 
-        output = tf.reshape(
-                output,
-                [batch_size,
-                    output_row_num * output_row_num * num_of_anchor_boxes,
-                        5+num_of_classes])
         result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
         return result
 
@@ -278,7 +296,7 @@ def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell)
         ground_truth: [batch_size, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
 
       Return:
-          images with boxes on it.
+          result: Images with ground truth bounding boxes on it.
     """
     with tf.variable_scope("build_image_scope"):
         feature_map_len = tf.shape(images)[1]/32
@@ -301,11 +319,51 @@ def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell)
         result = tf.image.draw_bounding_boxes(images, boxes, name="ground_truth_on_images")
         return result
 
+def fit_anchor_boxes(output, num_of_anchor_boxes, anchors):
+    """Fit the output from the neural network to pre-defined anchor boxes.
+
+      Args:
+        output: Computed output from the network. In shape
+                [batch_size,
+                    image_size/32,
+                        image_size/32,
+                            (num_of_anchor_boxes * (5 + num_of_classes))]
+        anchors: Pre-defined anchor boxes.
+      Return:
+        result: Output after fixed with the corresponding anchor boxes."""
+
+    def _fit_single(anchor, split):
+        """Fit a single anchor box"""
+        assert len(anchor) == 2, "Incorrect anchor length"
+        xs = split[..., 0:1]
+        ys = split[..., 1:2]
+        ws = split[..., 2:3]
+        hs = split[..., 3:4]
+        obj = split[..., 4:5]
+        left = split[..., 5:]
+
+        fit_xs = tf.minimum(tf.sigmoid(xs)+anchor[0], 0.999)
+        fit_ys = tf.minimum(tf.sigmoid(ys)+anchor[1], 0.999)
+        #w/h is fixed in the current implementation...
+        fit_ws = tf.maximum(tf.minimum(tf.sigmoid(tf.exp(ws)), 0.999), 0.01)
+        fit_hs = tf.maximum(tf.minimum(tf.sigmoid(tf.exp(hs)), 0.999), 0.01)
+        fit_obj = tf.sigmoid(obj)
+
+        return tf.concat([fit_xs, fit_ys, fit_ws, fit_hs, fit_obj, left], axis=-1)
+    # -- END --
+    splits = tf.split(output, num_of_anchor_boxes, axis=-1)
+    fit = []
+    for anchor, split in zip(anchors, splits):
+        fit.append(_fit_single(anchor, split))
+    result = tf.concat(fit, axis=-1)
+    return result
+
 def train():
     """ Train the YOLOvx network. """
 
     training_file_list = FLAGS.training_file_list
     class_name_file = FLAGS.class_name_file
+    starter_learning_rate = FLAGS.starter_learning_rate
     batch_size = FLAGS.batch_size
     num_of_image_scales = FLAGS.num_of_image_scales
     image_size_min = FLAGS.image_size_min
@@ -320,6 +378,7 @@ def train():
     backbone_arch = FLAGS.backbone_arch
     freeze_backbone = FLAGS.freeze_backbone
     infer_threshold = FLAGS.infer_threshold
+    summary_steps = FLAGS.summary_steps
 
     variable_sizes = []
     for i in range(num_of_image_scales):
@@ -337,6 +396,10 @@ def train():
                                  num_of_classes=num_of_classes,
                                  freeze_backbone=freeze_backbone,
                                  reuse=tf.AUTO_REUSE)
+    # TODO should not be hard-coded.
+    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    _y = fit_anchor_boxes(_y, num_of_anchor_boxes, anchors)
+
     _y_gt = tf.placeholder(tf.float32, [None, None, None, 5*num_of_gt_bnx_per_cell])
 
     global_step = tf.Variable(0, name='self_global_step',
@@ -358,15 +421,15 @@ def train():
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
 
-    starter_learning_rate = 1e-4
-    learning_rate = tf.train.exponential_decay(
-            learning_rate=starter_learning_rate,
-            global_step=global_step,
-            decay_steps=500,
-            decay_rate=0.95,
-            staircase=True
-        )
-    # train_step = tf.train.AdamOptimizer(1e-5).minimize(loss, global_step=global_step)
+#    starter_learning_rate = 1e-2
+#    learning_rate = tf.train.exponential_decay(
+#            learning_rate=starter_learning_rate,
+#            global_step=global_step,
+#            decay_steps=500,
+#            decay_rate=0.95,
+#            staircase=True
+#        )
+    learning_rate = starter_learning_rate
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
 
@@ -403,8 +466,6 @@ def train():
 
     initializer = tf.global_variables_initializer()
 
-    # run_option = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-    # run_metadata = tf.RunMetadata()
     run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
                                             log_device_placement=False))
@@ -456,15 +517,14 @@ def train():
                 options=run_option,
                 # run_metadata=run_metadata,
             )
-        # validate per 200 iterations
-        if (idx+1) % 200 == 0:
+        # validate per `summary_steps' iterations
+        if idx % summary_steps == 0:
             train_writer.add_summary(train_summary, idx)
 
         elapsed_time = datetime.datetime.now() - start_time
         sys.stdout.write(
-          "Elapsed time: {}, LossVal: {:10.10f} | ".format(elapsed_time, loss_val)
+          "Elapsed time: {}, LossVal: {:10.10f}\n".format(elapsed_time, loss_val)
         )
-        print("Validating this batch....")
 
         # NOTE by now, global_step is always == idx+1, because we have do
         # `train_step`...

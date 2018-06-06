@@ -56,7 +56,8 @@ def inception_v1_base(inputs,
   with tf.variable_scope(scope, 'InceptionV1', [inputs]):
     with slim.arg_scope(
         [slim.conv2d, slim.fully_connected],
-        weights_initializer=trunc_normal(0.01)):
+        weights_initializer=trunc_normal(0.01),
+        activation_fn=tf.nn.leaky_relu):
       with slim.arg_scope([slim.conv2d, slim.max_pool2d],
                           stride=1, padding='SAME'):
         end_point = 'Conv2d_1a_7x7'
