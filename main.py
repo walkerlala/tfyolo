@@ -6,6 +6,7 @@ import os
 import pdb
 import sys
 import cv2
+import numpy as np
 import tensorflow as tf
 from utils.dataset import DatasetReader
 from utils.dataset import ImageHandler
@@ -21,6 +22,7 @@ trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 tf.app.flags.DEFINE_boolean("train", False, "To train or not to train.")
 tf.app.flags.DEFINE_boolean("dotcount", False, "To train the Dotcount model.")
 tf.app.flags.DEFINE_boolean("test", False, "To test or not to test.")
+tf.app.flags.DEFINE_boolean("evaluate", False, "To evaluate or not to evaluate.")
 tf.app.flags.DEFINE_boolean("multiple_images", False, "Predict for multiple images.")
 
 tf.app.flags.DEFINE_string("infile", "Image.jpg", "The image to predict.")
@@ -596,6 +598,167 @@ def train():
         idx += 1
     print("End of training.")
 
+def test():
+    """Test the YOLOvx network"""
+
+    tf.logging.info("Building tensorflow graph...")
+
+    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    _y, vars_to_restore = YOLOvx(
+                            _x,
+                            backbone_arch=FLAGS.backbone_arch,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes
+                          )
+    # TODO should not be hard-coded.
+    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+
+    output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
+    y_scaled = scale_output(
+                    _y,
+                    output_scale_placeholder,
+                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                    num_of_classes=FLAGS.num_of_classes
+               )
+    images_with_bboxes = build_images_with_bboxes(
+                            output=y_scaled,
+                            images=_x,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes,
+                            infer_threshold=FLAGS.infer_threshold
+                         )
+    global_step = tf.Variable(0, name='self_global_step',
+                              trainable=False, dtype=tf.int32)
+
+    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    all_vars.extend(vars_to_restore)
+    all_vars = list(set(all_vars))
+    all_vars.append(global_step)
+    tf.logging.info("All network loss/train_step built! Yah!")
+
+    image_handler = ImageHandler(FLAGS.multiple_images, FLAGS.infile)
+
+    initializer = tf.global_variables_initializer()
+
+    if FLAGS.multiple_images:
+        if not os.path.exists(FLAGS.outdir):
+            os.makedirs(FLAGS.outdir)
+
+    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
+                                            log_device_placement=False))
+    sess.run(initializer)
+
+    restorer = tf.train.Saver(all_vars)
+    restorer = restorer.restore(sess, FLAGS.checkpoint)
+    tf.logging.info("checkpoint restored!")
+
+    idx = 1
+    while True:
+        (batch_xs, batch_xs_scale_info,
+            batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+        if not len(batch_xs): break
+        sys.stdout.write("Testing batch[{}]...".format(idx))
+        idx += 1
+        sys.stdout.flush()
+        start_time = datetime.datetime.now()
+        final_images = sess.run(images_with_bboxes,
+                                feed_dict={
+                                    _x: batch_xs,
+                                    output_scale_placeholder: outscale
+                                },
+                                options=run_option)
+        elapsed_time = datetime.datetime.now() - start_time
+        sys.stdout.write(
+          "Prediction time: {} | Writing images...".format(elapsed_time)
+        )
+
+        image_handler.write_batch(
+                        final_images,
+                        batch_xs_scale_info,
+                        batch_xs_names,
+                        FLAGS.multiple_images,
+                        FLAGS.outdir,
+                        FLAGS.outfile
+                      )
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+def eval():
+    """Evaluate the current model (compute mAP and the like)."""
+
+    print("eval() not implemented currently because we don't need it")
+    return
+    tf.logging.info("Building tensorflow graph...")
+
+    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    _y, vars_to_restore = YOLOvx(
+                            _x,
+                            backbone_arch=FLAGS.backbone_arch,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes
+                          )
+    # TODO should not be hard-coded.
+    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    _y_gt = tf.placeholder(
+                tf.float32,
+                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+            )
+
+    # restore all variables
+    global_step = tf.Variable(0, name='self_global_step',
+                              trainable=False, dtype=tf.int32)
+    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    all_vars.extend(vars_to_restore)
+    all_vars = list(set(all_vars))
+    all_vars.append(global_step)
+    initializer = tf.global_variables_initializer()
+    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
+                                            log_device_placement=False))
+    sess.run(initializer)
+    restorer = tf.train.Saver(all_vars)
+    restorer = restorer.restore(sess, FLAGS.checkpoint)
+    tf.logging.info("checkpoint restored!")
+
+    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+
+    image_size = 320
+    idx = 1
+    op_batch = None
+    gt_batch = None
+    while True:
+        (batch_xs,
+         batch_ys,
+         outscale) = reader.next_batch(
+                       batch_size=FLAGS.batch_size,
+                       image_size=image_size,
+                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                       infinite=False
+                     )
+        if not batch_xs: break
+
+        sys.stdout.write("Running eval_step[{}]...".format(idx))
+        sys.stdout.flush()
+        idx += 1
+        start_time = datetime.datetime.now()
+        op, gt = sess.run([_y, _gt], feed_dict={_x: batch_xs}, options=run_option)
+        elapsed_time = datetime.datetime.now() - start_time
+        sys.stdout.write("Prediction time: {}\n".format(elapsed_time))
+        sys.stdout.flush()
+        if not op_batch:
+            op_batch = op
+            gt_batch = gt
+        else:
+            op_batch = np.concatenate([op_batch, op], axis=0)
+            gt_batch = np.concatenate([gt_batch, gt], axis=0)
+    # calculating mAP
+    mAP = map_batch(op_batch, gt_batch, FLAGS.infer_threshold)
+    print("mAP: {}".format(mAP))
+
 def pad_anchor_boxes(output, num_of_anchor_boxes, anchors):
     """Pad the output from the neural network, which only has the confidence
     value, with x/y coordinates of pre-defined anchor boxes.
@@ -794,8 +957,42 @@ def train_dot_count():
         idx += 1
     print("End of training.")
 
-def test():
-    """Test the YOLOvx network"""
+def count_persons(output, infer_threshold):
+    """Count the number of predictions whose confidence is higher than @infer_threshold.
+
+      Args:
+          output: Output of the neural network. In shape
+            [batch_size, image_size/32, image_size/32, num_of_anchor_boxes]
+          infer_threshold: See FLAGS.infer_threshold.
+      Return:
+          result: Number of persons in each image. In shape
+            [batch_size, 1]
+    """
+    shape = tf.shape(output)
+    output = tf.reshape(output, [shape[0], -1])
+    output = tf.cast(tf.greater(output, infer_threshold), tf.int32)
+    result = tf.reduce_sum(output, axis=1)
+    return result
+
+def cal_mae(output_counts, ground_truth_counts):
+    """Calculater MAE in batch.
+
+      Args:
+          output_counts: A numpy array of shape [batch_size, ].
+          ground_truth_counts: A numpy array of shape [batch_size, ].
+      Return:
+          mae: the average mae.
+    """
+    assert np.shape(output_counts) == np.shape(ground_truth_counts), \
+            "Shape mismatch!!"
+    total_error = 0.0
+    for oc, gc in zip(output_counts, ground_truth_counts):
+        total_error += abs(oc - gc)
+    result = total_error / len(output_counts)
+    return result
+
+def eval_dotcount_model():
+    """Evaluate the dotcount model using MAE (mean absolute error)."""
 
     tf.logging.info("Building tensorflow graph...")
 
@@ -804,26 +1001,14 @@ def test():
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
                             num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes
+                            freeze_backbone=True,
+                            only_confidence=True,
+                            reuse=tf.AUTO_REUSE
                           )
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    counts = count_persons(_y, FLAGS.infer_threshold)
 
-    output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
-    y_scaled = scale_output(
-                    _y,
-                    output_scale_placeholder,
-                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                    num_of_classes=FLAGS.num_of_classes
-               )
-    images_with_bboxes = build_images_with_bboxes(
-                            output=y_scaled,
-                            images=_x,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes,
-                            infer_threshold=FLAGS.infer_threshold
-                         )
+    _y_gt = tf.placeholder(tf.int32, [None, 1])
+
     global_step = tf.Variable(0, name='self_global_step',
                               trainable=False, dtype=tf.int32)
 
@@ -831,19 +1016,18 @@ def test():
     all_vars.extend(vars_to_restore)
     all_vars = list(set(all_vars))
     all_vars.append(global_step)
+
     tf.logging.info("All network loss/train_step built! Yah!")
 
-    image_handler = ImageHandler(FLAGS.multiple_images, FLAGS.infile)
+    # load images and labels
+    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
 
     initializer = tf.global_variables_initializer()
-
-    if FLAGS.multiple_images:
-        if not os.path.exists(FLAGS.outdir):
-            os.makedirs(FLAGS.outdir)
 
     run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
     sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
                                             log_device_placement=False))
+
     sess.run(initializer)
 
     restorer = tf.train.Saver(all_vars)
@@ -851,109 +1035,31 @@ def test():
     tf.logging.info("checkpoint restored!")
 
     idx = 1
+    image_size = 320
+    mae = 0
     while True:
-        (batch_xs, batch_xs_scale_info,
-            batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+        batch_xs, batch_ys, _ = reader.next_batch(
+                                  FLAGS.batch_size,
+                                  image_size=image_size,
+                                  only_person_num=True,
+                                  infinite=False
+                                )
         if not len(batch_xs): break
         sys.stdout.write("Testing batch[{}]...".format(idx))
         idx += 1
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        final_images = sess.run(images_with_bboxes,
-                                feed_dict={
-                                    _x: batch_xs,
-                                    output_scale_placeholder: outscale
-                                },
-                                options=run_option)
+        output_counts = sess.run(counts,
+                                 feed_dict={_x: batch_xs},
+                                 options=run_option)
         elapsed_time = datetime.datetime.now() - start_time
+        error = cal_mae(output_counts, batch_ys)
+        mae += error
         sys.stdout.write(
-          "Prediction time: {} | Writing images...".format(elapsed_time)
+            "Prediction time: {} | Current mae: {}\n".format(elapsed_time, mae)
         )
 
-        image_handler.write_batch(
-                        final_images,
-                        batch_xs_scale_info,
-                        batch_xs_names,
-                        FLAGS.multiple_images,
-                        FLAGS.outdir,
-                        FLAGS.outfile
-                      )
-
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-
-def eval():
-    """Evaluate the current model (compute mAP and the like)."""
-
-    print("eval() not implemented currently because we don't need it")
-    return
-    tf.logging.info("Building tensorflow graph...")
-
-    _x = tf.placeholder(tf.float32, [None, None, None, 3])
-    _y, vars_to_restore = YOLOvx(
-                            _x,
-                            backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes
-                          )
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
-    _y_gt = tf.placeholder(
-                tf.float32,
-                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
-            )
-
-    # restore all variables
-    global_step = tf.Variable(0, name='self_global_step',
-                              trainable=False, dtype=tf.int32)
-    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-    all_vars.extend(vars_to_restore)
-    all_vars = list(set(all_vars))
-    all_vars.append(global_step)
-    initializer = tf.global_variables_initializer()
-    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
-                                            log_device_placement=False))
-    sess.run(initializer)
-    restorer = tf.train.Saver(all_vars)
-    restorer = restorer.restore(sess, FLAGS.checkpoint)
-    tf.logging.info("checkpoint restored!")
-
-    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
-
-    image_size = 320
-    idx = 1
-    op_batch = None
-    gt_batch = None
-    while True:
-        (batch_xs,
-         batch_ys,
-         outscale) = reader.next_batch(
-                       batch_size=FLAGS.batch_size,
-                       image_size=image_size,
-                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
-                       infinite=False
-                     )
-        if not batch_xs: break
-
-        sys.stdout.write("Running eval_step[{}]...".format(idx))
-        sys.stdout.flush()
-        idx += 1
-        start_time = datetime.datetime.now()
-        op, gt = sess.run([_y, _gt], feed_dict={_x: batch_xs}, options=run_option)
-        elapsed_time = datetime.datetime.now() - start_time
-        sys.stdout.write("Prediction time: {}\n".format(elapsed_time))
-        sys.stdout.flush()
-        if not op_batch:
-            op_batch = op
-            gt_batch = gt
-        else:
-            op_batch = np.concatenate([op_batch, op], axis=0)
-            gt_batch = np.concatenate([gt_batch, gt], axis=0)
-    # calculating mAP
-    mAP = map_batch(op_batch, gt_batch, FLAGS.infer_threshold)
-    print("mAP: {}".format(mAP))
+    print("\nFinal MAE: {}\n".format(mae))
 
 def main(_):
 
@@ -972,6 +1078,10 @@ def main(_):
     elif FLAGS.test:
         tf.logging.info("Started in testing mode...")
         test()
+    elif FLAGS.evaluate:
+        tf.logging.info("Started in eval mode...")
+        if FLAGS.dotcount:
+            eval_dotcount_model()
 
 if __name__ == '__main__':
     tf.app.run()

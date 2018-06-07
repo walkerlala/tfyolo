@@ -108,7 +108,7 @@ class DatasetReader():
                 outscale[i][j].append(row_num)
         return outscale
 
-    def next_batch(self, batch_size=50, image_size=320,
+    def next_batch(self, batch_size=50, image_size=320, only_person_num=False,
                    num_of_gt_bnx_per_cell=20, normalize_image=True,
                    infinite=True):
         """ Return next batch of images.
@@ -139,8 +139,9 @@ class DatasetReader():
             filename = next(self._images_list_iter, None)
             if not filename:
                 if not infinite and not len(batch_xs_filename):
-                    return (None, None, None)
+                    return ([], [], None)
                 elif len(batch_xs_filename):
+                    batch_size = len(batch_xs_filename)
                     break
                 self._images_list_iter = iter(self._images_list)
                 filename = next(self._images_list_iter)
@@ -173,6 +174,17 @@ class DatasetReader():
             batch_xs.append(im)
 
             yfile = open(y_path, "r")
+
+            if only_person_num:
+                cnts = 0
+                for line in yfile:
+                    line = line.strip()
+                    if line:
+                        cnts += 1
+                batch_ys.append(cnts)
+                yfile.close()
+                continue
+
             gt_bnxs = []
             for line in yfile:
                 line = line.strip()
@@ -227,14 +239,16 @@ class DatasetReader():
         batch_xs = np.array(batch_xs)
         batch_ys = np.array(batch_ys)
 
-        assert batch_xs.shape == (batch_size, image_size, image_size, 3), \
+        batch_xs_shape = (batch_size, image_size, image_size, 3)
+        assert batch_xs.shape == batch_xs_shape, \
                 "batch_xs shape mismatch. shape: %s, expected: %s" \
-                  % (str(batch_xs.shape), str((batch_size, image_size, image_size, 3)))
-        assert batch_ys.shape == \
-                (batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell), \
+                  % (str(batch_xs.shape), str(batch_xs_shape))
+
+        batch_ys_shape = (batch_size, ) if only_person_num else \
+                          (batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell)
+        assert batch_ys.shape == batch_ys_shape, \
                 "batch_ys shape mismatch. shape: %s, expected: %s" \
-                  % (str(batch_ys.shape),
-                     str((batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell)))
+                  % (str(batch_ys.shape), str(batch_ys_shape))
 
         outscale = DatasetReader.get_outscale(image_size)
 
