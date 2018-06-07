@@ -80,8 +80,8 @@ def shortcut_from_input(images):
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
-def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
-           freeze_backbone=True, reuse=tf.AUTO_REUSE):
+def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
+           freeze_backbone=True, only_confidence=False, reuse=tf.AUTO_REUSE):
     """ This architecture of YOLO is not strictly the same as in those papers.
     We use some backbone networks as a starting point, and then add necessary
     layers on top of it. Therefore, we name it `YOLOvx (version x)`.
@@ -93,6 +93,8 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
         num_of_classes: see FLAGS.num_of_classes.
         reuse: Whether or not the network weights should be reused when
             building another YOLOvx in the same program.
+        only_confidence: include only confidence in the output (i.e., output
+            only the confidence of each bounding box, no x/y/w/h, etc).
         freeze_backbone: Whether or not to freeze the inception net backbone.
 
     Return:
@@ -122,13 +124,21 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes,
         backbone = slim.conv2d(backbone, 1024, [3, 3], scope='backbone_refined_4')
         # backbone = tf.concat([backbone, shortcut], axis=-1, name="backbone_with_shortcut")
 
-        # Follow the number of output in YOLOv3
-        net = slim.conv2d(
-                backbone,
-                num_of_anchor_boxes * (5 + num_of_classes),
-                [3, 3],
-                scope="Final_output"
-            )
+        if only_confidence:
+            net = slim.conv2d(
+                    backbone,
+                    num_of_anchor_boxes,
+                    [3, 3],
+                    scope="bboxes_only_confidence"
+                  )
+        else:
+            # Follow the number of output in YOLOv3
+            net = slim.conv2d(
+                    backbone,
+                    num_of_anchor_boxes * (5 + num_of_classes),
+                    [3, 3],
+                    scope="bboxes_full"
+                )
     return net, vars_to_restore
 
     # tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
@@ -199,7 +209,7 @@ class YOLOLoss():
 
     @staticmethod
     def bbox_iou_center_xy_batch(bboxes1, bboxes2):
-        """ Same as `bbox_overlap_iou_v1', except that:
+        """ Same as `bbox_iou_corner_xy()', except that:
 
           1. it use center_x, center_y, w, h instead of x1, y1, x2, y2.
           2. it operate on a batch rather than a piece of batch, and it
@@ -287,15 +297,15 @@ class YOLOLoss():
 
           Args:
             output: Computed output from the network. In shape
-                    [batch_size,
+                [batch_size,
+                    image_size/32,
                         image_size/32,
-                            image_size/32,
-                                (num_of_anchor_boxes * (5 + num_of_classes))]
-            ground_truth: Ground truth bounding boxes.
-                          In shape [batch_size,
-                                      image_size/32,
-                                        image_size/32,
-                                          5 * num_of_gt_bnx_per_cell].
+                            num_of_anchor_boxes * (5 + num_of_classes)]
+            ground_truth: Ground truth bounding boxes. In shape
+                [batch_size,
+                    image_size/32,
+                        image_size/32,
+                            num_of_gt_bnx_per_cell * 5]
           Return:
               loss: The final loss (after tf.reduce_mean()).
         """
@@ -303,11 +313,6 @@ class YOLOLoss():
         num_of_anchor_boxes = self.num_of_anchor_boxes
         num_of_classes = self.num_of_classes
         num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
-
-        # shape of output:
-        #   [?, ?, ?, num_of_anchor_boxes * (5 + num_of_classes))
-        # shape of ground_truth:
-        #   [?, ?, ?, 5 * num_of_gt_bnx_per_cell]
 
         # concat ground_truth and output to make a tensor of shape 
         #   (?, ?, ?, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell)
@@ -358,7 +363,12 @@ class YOLOLoss():
         # mask out fake gt_op pair
         nonzero_mask = tf.reduce_any(tf.not_equal(0.0, gt_boxes_max), axis=1)
         iou_max_boxes = tf.boolean_mask(iou_max_boxes_raw, nonzero_mask)
-        # iou_max_boxes = tf.Print(iou_max_boxes, [iou_max_boxes], "###iou_max_boxes: ", summarize=1000)
+        #iou_max_boxes = tf.Print(
+        #        iou_max_boxes,
+        #        [iou_max_boxes],
+        #        "###iou_max_boxes: ",
+        #        summarize=1000
+        #    )
         # Compute the real iou one by one
         iou_flat = YOLOLoss.bbox_iou_center_xy_flat(
                     iou_max_boxes[..., 0:4],
@@ -371,6 +381,7 @@ class YOLOLoss():
                            tf.float32
                        )[..., None]
         filtered_one_hot = one_hot_idx * nonzero_mask
+        # [-1, num_of_anchor_boxes]
         active_op = tf.sign(tf.reduce_sum(filtered_one_hot, axis=1))
         nonactive_op = 1 - active_op
         nonactive_op_idx = tf.where(tf.equal(1.0, nonactive_op))
@@ -382,23 +393,36 @@ class YOLOLoss():
                         tf.sqrt(iou_max_boxes[:, 2:4])-tf.sqrt(iou_max_boxes[:, _5_nc+3:_5_nc+5])
                     )
         cooridniates_se_xy = tf.square(iou_max_boxes[:, 0:2]-iou_max_boxes[:, _5_nc+1:_5_nc+3])
-        # TODO try also verify the number of nonactive boxes
-        #cooridniates_se_xy = tf.Print(cooridniates_se_xy, [tf.shape(iou_max_boxes[:, 2:4]),
-        #                                                   tf.shape(iou_max_boxes[:, _5_nc+3:_5_nc+5]),
-        #                                                   tf.shape(iou_max_boxes[:, 0:2]),
-        #                                                   tf.shape(iou_max_boxes[:, _5_nc+1:_5_nc+3])], "Shape info: ")
+        #cooridniates_se_xy = tf.Print(
+        #        cooridniates_se_xy,
+        #        [tf.shape(iou_max_boxes[:, 2:4]),
+        #         tf.shape(iou_max_boxes[:, _5_nc+3:_5_nc+5]),
+        #         tf.shape(iou_max_boxes[:, 0:2]),
+        #         tf.shape(iou_max_boxes[:, _5_nc+1:_5_nc+3])],
+        #        "Shape info: "
+        #    )
         cooridniates_se = tf.concat([cooridniates_se_xy, cooridniates_se_wh], axis=-1)
         cooridniates_loss = tf.reduce_sum(cooridniates_se)
 
         # objectness loss TODO
         # objectness_se = tf.square(iou_max_boxes[:, 4] - iou_flat)
         objectness_se = tf.square(iou_max_boxes[:, 4] - 1)
-        # objectness_se = tf.Print(objectness_se, [iou_max_boxes[:, 4]], "######objectness output: ", summarize=10000)
+        #objectness_se = tf.Print(
+        #        objectness_se,
+        #        [iou_max_boxes[:, 4]],
+        #        "######objectness output: ",
+        #        summarize=10000
+        #    )
         objectness_loss = tf.reduce_sum(objectness_se)
 
         # nonobjectness loss
         nonobjectness_se = tf.square(op_never_matched[:, 4]-0)
-        # nonobjectness_se = tf.Print(nonobjectness_se, [op_never_matched[:, 4]], "!!!!!!nonobjectness_se output: ", summarize=10000)
+        #nonobjectness_se = tf.Print(
+        #        nonobjectness_se,
+        #        [op_never_matched[:, 4]],
+        #        "!!!!!!nonobjectness_se output: ",
+        #        summarize=10000
+        #    )
         nonobjectness_loss = tf.reduce_sum(nonobjectness_se)
 
         #classness loss (TODO)
@@ -407,9 +431,185 @@ class YOLOLoss():
         # so we take its ln. Even that, most "nonobject boxes" have a objectness
         # lower than 0.5, so we think it is OK that we kind of "ignore" it.
         nonobjectness_loss = tf.log(nonobjectness_loss)
-        # objectness_loss = tf.Print(objectness_loss, [cooridniates_loss, objectness_loss, nonobjectness_loss], "cl & ol & nol: ")
+        #objectness_loss = tf.Print(
+        #        objectness_loss,
+        #        [cooridniates_loss, objectness_loss, nonobjectness_loss],
+        #        "cl & ol & nol: "
+        #    )
         tf.summary.scalar("cooridniates_loss", cooridniates_loss)
         tf.summary.scalar("objectness_loss", objectness_loss)
         tf.summary.scalar("nonobjectness_loss", nonobjectness_loss)
         loss = 0.5*cooridniates_loss + 1*objectness_loss + 1*nonobjectness_loss
         return loss
+
+class DotcountLoss():
+    """Provide methods for calculating loss for the dotcount model."""
+
+    def __init__(self, batch_size, num_of_anchor_boxes,
+                 num_of_gt_bnx_per_cell, global_step):
+        """
+          Args:
+            (see their difinition in FLAGS)
+            global_step: A tensor, used to switch between loss function
+        """
+        self.__batch_size = batch_size
+        self.num_of_anchor_boxes = num_of_anchor_boxes
+        self.num_of_gt_bnx_per_cell = num_of_gt_bnx_per_cell
+        self.global_step = global_step
+
+    @staticmethod
+    def bbox_dist_center_xy_batch(bboxes1, bboxes2):
+        """Calculate distances between @bboxes1 and @bboxes2 in a
+        broadcasting manner, but return it as 1/distance so that the smallest
+        distance has the largest result.
+
+        Note that this function operates batch by batch and retains the batch
+        structure, as in `YOLOLoss.bbox_iou_center_xy_batch()'.
+
+          Args:
+              bboxes1: [batch_size, d21, 2]
+              bboxes2: [batch_size, d22, 2]
+          Return:
+              [batch_size, d21, d22, 1]
+        """
+        x11, y11 = tf.split(bboxes1, 2, axis=2)
+        x21, y21 = tf.split(bboxes2, 2, axis=2)
+
+        xi1 = tf.maximum(x11, tf.transpose(x21, perm=[0,2,1]))
+        xi2 = tf.minimum(x11, tf.transpose(x21, perm=[0,2,1]))
+
+        yi1 = tf.maximum(y11, tf.transpose(y21, perm=[0,2,1]))
+        yi2 = tf.minimum(y11, tf.transpose(y21, perm=[0,2,1]))
+
+        distance = tf.sqrt(tf.square(xi1 - xi2) + tf.square(yi1 - yi2))
+        return 1 / (distance+0.0001)
+
+    def calculate_loss(self, output, ground_truth):
+        """Calculate loss as described in the dotcount model.
+
+          Args:
+              output: Computed output from the network. In shape
+                [batch_size,
+                    image_size/32,
+                        image_size/32,
+                            num_of_anchor_boxes * 3]
+              ground_truth: Ground truth bouding boxes. In shape
+                [batch_size,
+                    image_size/32,
+                        image_size/32,
+                            num_of_gt_bnx_per_cell * 5]
+          Return:
+              loss: The final loss.
+        """
+        num_of_anchor_boxes = self.num_of_anchor_boxes
+        num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
+
+        # take only its x/y
+        gt_shape = tf.shape(ground_truth)
+        ground_truth = tf.reshape(
+                ground_truth,
+                [gt_shape[0], gt_shape[1], gt_shape[2], num_of_gt_bnx_per_cell, 5]
+            )
+        ground_truth = ground_truth[..., 1:3]
+        ground_truth = tf.reshape(
+                ground_truth,
+                [gt_shape[0], gt_shape[1], gt_shape[2], -1]
+            )
+
+        output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
+                                            name="output_and_ground_truth_concat")
+        op_and_gt_batch = \
+                tf.reshape(
+                    output_and_ground_truth,
+                    [-1, num_of_anchor_boxes*3 + num_of_gt_bnx_per_cell*2]
+                )
+
+        split_num = num_of_anchor_boxes * 3
+        op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
+                              [-1, num_of_anchor_boxes, 3])
+        #op_boxes = tf.Print(
+        #        op_boxes,
+        #        [op_boxes[..., 2]],
+        #        "op_boxes objectness: ",
+        #        summarize=10000
+        #    )
+        gt_boxes = tf.reshape(op_and_gt_batch[..., split_num:],
+                              [-1, num_of_gt_bnx_per_cell, 2])
+        # fake ground truth bboxes have 0.0 in their x/y.
+
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        #
+        # NOTE this function return 1/distance, so the pair who have the
+        # smallest distance will have the largest result.
+        distances = DotcountLoss.bbox_dist_center_xy_batch(gt_boxes,
+                                                           op_boxes[..., 0:2])
+        # [-1, num_of_gt_bnx_per_cell, 1]
+        values, idx = tf.nn.top_k(distances, k=1)
+        # [-1, num_of_gt_bnx_per_cell]
+        # We don't use tf.squeeze() here because `num_of_gt_bnx_per_cell' may be 1
+        idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
+
+        # Get tuples of (gt, op) will the max distance (i.e., those who match)
+        #
+        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+        full_idx = tf.where(tf.equal(1.0, one_hot_idx))
+        gt_idx = full_idx[:, 0:2]
+        op_idx = full_idx[:, 0:3:2]
+        # [?, 2]
+        gt_boxes_max = tf.gather_nd(gt_boxes, gt_idx)
+        # [?, 3]
+        op_boxes_max = tf.gather_nd(op_boxes, op_idx)
+        # [?, 3 + 2].
+        # Note the order in which they are concatenated!!!
+        dist_max_boxes_raw = tf.concat([op_boxes_max, gt_boxes_max], axis=1)
+        # mask out fake gt_op pair
+        nonzero_mask = tf.reduce_any(tf.not_equal(0.0, gt_boxes_max), axis=1)
+        dist_max_boxes = tf.boolean_mask(dist_max_boxes_raw, nonzero_mask)
+
+        # Compute the real dist one by one
+        #dist_flat = DotcountLoss.bbox_dist_center_xy_flat(
+        #                            dist_max_boxes[..., 0:2],
+        #                            dist_max_boxes[..., 3:5]
+        #                         )
+
+        # Get op boxes which are never matched by any non-fake gt boxes
+        nonzero_mask = tf.cast(
+                            tf.reduce_any(tf.not_equal(0.0, gt_boxes), axis=2),
+                            tf.float32
+                       )[..., None]
+        filtered_one_hot = one_hot_idx * nonzero_mask
+        # [-1, num_of_anchor_boxes]
+        active_op = tf.sign(tf.reduce_sum(filtered_one_hot, axis=1))
+        nonactive_op = 1 - active_op
+        nonactive_op_idx = tf.where(tf.equal(1.0, nonactive_op))
+        op_never_matched = tf.gather_nd(op_boxes, nonactive_op_idx)
+
+        # calculate loss
+        objectness_loss = tf.reduce_sum(tf.square(dist_max_boxes[..., 2]-1))
+        #objectness_loss = tf.Print(
+        #        objectness_loss,
+        #        [dist_max_boxes[..., 2]],
+        #        "dist_max_boxes objectness: ",
+        #        summarize=10000
+        #    )
+        nonobjectness_loss = tf.reduce_sum(tf.square(op_never_matched[..., 2]-0))
+        nonobjectness_loss = tf.log(nonobjectness_loss)
+        #nonobjectness_loss = tf.Print(
+        #        nonobjectness_loss,
+        #        [op_never_matched[..., 2]],
+        #        "op_never_matched nonobjectness: ",
+        #        summarize=10000
+        #    )
+        loss = objectness_loss + nonobjectness_loss
+        #loss = tf.Print(
+        #        loss,
+        #        [objectness_loss, nonobjectness_loss],
+        #        "ol & nol: ",
+        #        summarize=10000
+        #    )
+        tf.summary.scalar("objectness_loss", objectness_loss)
+        tf.summary.scalar("nonobjectness_loss", nonobjectness_loss)
+        tf.summary.scalar("loss", loss)
+        return loss
+

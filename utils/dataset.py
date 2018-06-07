@@ -124,8 +124,11 @@ class DatasetReader():
           Return:
             batch_xs: A batch of image, i.e., a numpy array in shape
                       [batch_size, image_size, image_size, 3]
-            batch_ys: A batch of ground truth bounding box value, in shape
-                      [batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell]
+            batch_ys: A batch of ground truth bounding box value. If only_xy is
+                False, it is in shape
+                    [batch_size, image_size/32, image_size/32, 5*num_of_gt_bnx_per_cell]
+                else, it is in shape
+                    [batch_size, image_size/32, image_size/32, 2*num_of_gt_bnx_per_cell]
             outscale: Scale information (of x/y coordinates) for this batch.
         """
         assert image_size % 32 == 0, "image_size should be multiple of 32"
@@ -137,6 +140,8 @@ class DatasetReader():
             if not filename:
                 if not infinite and not len(batch_xs_filename):
                     return (None, None, None)
+                elif len(batch_xs_filename):
+                    break
                 self._images_list_iter = iter(self._images_list)
                 filename = next(self._images_list_iter)
             batch_xs_filename.append(filename)
@@ -204,6 +209,7 @@ class DatasetReader():
                 y *= image_size
                 y %= cell_size
                 y /= cell_size
+
                 box = [label, x, y, w, h]
                 gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
                 assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"
@@ -220,6 +226,7 @@ class DatasetReader():
 
         batch_xs = np.array(batch_xs)
         batch_ys = np.array(batch_ys)
+
         assert batch_xs.shape == (batch_size, image_size, image_size, 3), \
                 "batch_xs shape mismatch. shape: %s, expected: %s" \
                   % (str(batch_xs.shape), str((batch_size, image_size, image_size, 3)))
