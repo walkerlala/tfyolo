@@ -9,6 +9,7 @@ import cv2
 import tensorflow as tf
 from utils.dataset import DatasetReader
 from utils.dataset import ImageHandler
+from utils.metrics import map_batch
 from networks.yolovx import YOLOvx
 from networks.yolovx import YOLOLoss
 from tensorflow.python.ops import control_flow_ops
@@ -21,7 +22,7 @@ tf.app.flags.DEFINE_boolean("test", False, "To test or not to test.")
 tf.app.flags.DEFINE_boolean("multiple_images", False, "Predict for multiple images.")
 
 tf.app.flags.DEFINE_string("infile", "Image.jpg", "The image to predict.")
-tf.app.flags.DEFINE_alias("files_list", "infile")
+tf.app.flags.DEFINE_alias("test_files_list", "infile")
 tf.app.flags.DEFINE_string("outfile", "Prediction.jpg", "Output path of the predictions.")
 tf.app.flags.DEFINE_alias("outdir", "outfile")
 
@@ -62,9 +63,12 @@ tf.app.flags.DEFINE_integer("summary_steps", 100, "Write summary ever X steps")
 #   1. Lable files should be put in the same directory and in the YOLO format
 #   2. Empty line and lines that start with # will be ignore.
 #      (But # at the end will not. Careful!)
-tf.app.flags.DEFINE_string("training_file_list",
-        "/disk1/labeled/trainall_roomonly.txt",
-        "File which contains all the training images.")
+tf.app.flags.DEFINE_string("train_files_list",
+        "/disk1/labeled/roomonly_train.txt",
+        "File which contains all images for training.")
+tf.app.flags.DEFINE_string("eval_files_list",
+        "/disk1/labeled/roomonly_valid.txt",
+        "File which contains all images for evaluation.")
 
 # Format of this file should be:
 #
@@ -470,7 +474,7 @@ def train():
     tf.logging.info("All network loss/train_step built! Yah!")
 
     # load images and labels
-    reader = DatasetReader(FLAGS.training_file_list, FLAGS.class_name_file)
+    reader = DatasetReader(FLAGS.train_files_list, FLAGS.class_name_file)
 
     initializer = tf.global_variables_initializer()
 
@@ -505,11 +509,14 @@ def train():
         if idx % 100 == 0 and idx:
             print("Switching to another image size: %d" % image_size)
 
-        batch_xs, batch_ys, outscale = reader.next_batch(
-                            batch_size=FLAGS.batch_size,
-                            image_size=image_size,
-                            num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
-                        )
+        (batch_xs,
+         batch_ys,
+         outscale) = reader.next_batch(
+                       batch_size=FLAGS.batch_size,
+                       image_size=image_size,
+                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                       infinite=True
+                     )
 
         sys.stdout.write("Running train_step[{}]...".format(idx))
         sys.stdout.flush()
@@ -633,6 +640,79 @@ def test():
 
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+def eval():
+    """Evaluate the current model (compute mAP and the like)."""
+
+    print("eval() not implemented currently because we don't need it")
+    return
+    tf.logging.info("Building tensorflow graph...")
+
+    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    _y, vars_to_restore = YOLOvx(
+                            _x,
+                            backbone_arch=FLAGS.backbone_arch,
+                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_of_classes=FLAGS.num_of_classes
+                          )
+    # TODO should not be hard-coded.
+    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    _y_gt = tf.placeholder(
+                tf.float32,
+                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+            )
+
+    # restore all variables
+    global_step = tf.Variable(0, name='self_global_step',
+                              trainable=False, dtype=tf.int32)
+    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+    all_vars.extend(vars_to_restore)
+    all_vars = list(set(all_vars))
+    all_vars.append(global_step)
+    initializer = tf.global_variables_initializer()
+    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
+                                            log_device_placement=False))
+    sess.run(initializer)
+    restorer = tf.train.Saver(all_vars)
+    restorer = restorer.restore(sess, FLAGS.checkpoint)
+    tf.logging.info("checkpoint restored!")
+
+    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+
+    image_size = 320
+    idx = 1
+    op_batch = None
+    gt_batch = None
+    while True:
+        (batch_xs,
+         batch_ys,
+         outscale) = reader.next_batch(
+                       batch_size=FLAGS.batch_size,
+                       image_size=image_size,
+                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                       infinite=False
+                     )
+        if not batch_xs: break
+
+        sys.stdout.write("Running eval_step[{}]...".format(idx))
+        sys.stdout.flush()
+        idx += 1
+        start_time = datetime.datetime.now()
+        op, gt = sess.run([_y, _gt], feed_dict={_x: batch_xs}, options=run_option)
+        elapsed_time = datetime.datetime.now() - start_time
+        sys.stdout.write("Prediction time: {}\n".format(elapsed_time))
+        sys.stdout.flush()
+        if not op_batch:
+            op_batch = op
+            gt_batch = gt
+        else:
+            op_batch = np.concatenate([op_batch, op], axis=0)
+            gt_batch = np.concatenate([gt_batch, gt], axis=0)
+    # calculating mAP
+    mAP = map_batch(op_batch, gt_batch, FLAGS.infer_threshold)
+    print("mAP: {}".format(mAP))
 
 def main(_):
 

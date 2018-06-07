@@ -109,7 +109,8 @@ class DatasetReader():
         return outscale
 
     def next_batch(self, batch_size=50, image_size=320,
-                   num_of_gt_bnx_per_cell=20, normalize_image=True):
+                   num_of_gt_bnx_per_cell=20, normalize_image=True,
+                   infinite=True):
         """ Return next batch of images.
 
           Args:
@@ -118,6 +119,7 @@ class DatasetReader():
                 then it will be resized to [image_size, image_size, 3].
             num_of_gt_bnx_per_cell: See FLAGS.num_of_gt_bnx_per_cell.
             normalize_image: To or to not normalize the image (to [0, 1]).
+            infinite: Whether or not to loop all images infinitely.
 
           Return:
             batch_xs: A batch of image, i.e., a numpy array in shape
@@ -133,6 +135,8 @@ class DatasetReader():
         for _ in range(batch_size):
             filename = next(self._images_list_iter, None)
             if not filename:
+                if not infinite and not len(batch_xs_filename):
+                    return (None, None, None)
                 self._images_list_iter = iter(self._images_list)
                 filename = next(self._images_list_iter)
             batch_xs_filename.append(filename)
