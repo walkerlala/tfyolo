@@ -104,7 +104,7 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
     """
 
     backbone, vars_to_restore = backbone_network(images, backbone_arch, reuse=reuse)
-    shortcut = shortcut_from_input(images)
+    # shortcut = shortcut_from_input(images)
 
     with slim.arg_scope([slim.conv2d],
                         weights_initializer=trunc_normal(0.01),
@@ -132,7 +132,6 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
                     scope="bboxes_only_confidence"
                   )
         else:
-            # Follow the number of output in YOLOv3
             net = slim.conv2d(
                     backbone,
                     num_of_anchor_boxes * (5 + num_of_classes),
@@ -140,11 +139,6 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
                     scope="bboxes_full"
                 )
     return net, vars_to_restore
-
-    # tf.summary.histogram("all_weights", tf.contrib.layers.summarize_collection(tf.GraphKeys.WEIGHTS))
-    # tf.summary.histogram("all_bias", tf.contrib.layers.summarize_collection(tf.GraphKeys.BIASES))
-    # tf.summary.histogram("all_activations", tf.contrib.layers.summarize_collection(tf.GraphKeys.ACTIVATIONS))
-    # tf.summary.histogram("all_global_step", tf.contrib.layers.summarize_collection(tf.GraphKeys.GLOBAL_STEP))
 
 class YOLOLoss():
     """ Provides methods for calculating loss """
@@ -511,6 +505,7 @@ class DotcountLoss():
                 [gt_shape[0], gt_shape[1], gt_shape[2], num_of_gt_bnx_per_cell, 5]
             )
         ground_truth = ground_truth[..., 1:3]
+        # [-1, -1, -1, 2]
         ground_truth = tf.reshape(
                 ground_truth,
                 [gt_shape[0], gt_shape[1], gt_shape[2], -1]
@@ -553,8 +548,11 @@ class DotcountLoss():
         #
         # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
         one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+        # [-1, 3]
         full_idx = tf.where(tf.equal(1.0, one_hot_idx))
+        # [-1, 2]
         gt_idx = full_idx[:, 0:2]
+        # [-1, 2]
         op_idx = full_idx[:, 0:3:2]
         # [?, 2]
         gt_boxes_max = tf.gather_nd(gt_boxes, gt_idx)
@@ -601,6 +599,7 @@ class DotcountLoss():
         #        "op_never_matched nonobjectness: ",
         #        summarize=10000
         #    )
+
         loss = objectness_loss + nonobjectness_loss
         #loss = tf.Print(
         #        loss,
@@ -608,6 +607,7 @@ class DotcountLoss():
         #        "ol & nol: ",
         #        summarize=10000
         #    )
+
         tf.summary.scalar("objectness_loss", objectness_loss)
         tf.summary.scalar("nonobjectness_loss", nonobjectness_loss)
         tf.summary.scalar("loss", loss)

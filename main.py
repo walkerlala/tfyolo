@@ -50,7 +50,10 @@ tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolockpts/",
 tf.app.flags.DEFINE_string("train_log_dir", "/disk1/yolotraining/",
         "Path to save tfevent (for tensorboard)")
 
-tf.app.flags.DEFINE_float("starter_learning_rate", 1e-2, "Starter learning rate")
+tf.app.flags.DEFINE_boolean("exponential_decay", False, "")
+tf.app.flags.DEFINE_float("starter_learning_rate", 1e-2, "")
+tf.app.flags.DEFINE_float("decay_steps", 10000, "")
+tf.app.flags.DEFINE_float("decay_rate", 0.95, "")
 
 tf.app.flags.DEFINE_integer("batch_size", 64, "Batch size.")
 
@@ -301,7 +304,7 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
                                     outut[..., 2:3], output_pad_cls], axis=-1)
             else:
                 output = tf.concat(
-                            [output[..., 0:2], output_pad_wh, output[..., 2:3]],
+                            [output[..., 0:2], output_pad_wh, output[..., 2:]],
                             axis=-1
                          )
 
@@ -441,6 +444,9 @@ def train():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAG.num_of_anchor_boxes == 5:
+        print("Should have 5 anchor boxes in dotcount model.")
+        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
@@ -467,15 +473,16 @@ def train():
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
 
-#    starter_learning_rate = 1e-2
-#    learning_rate = tf.train.exponential_decay(
-#            learning_rate=starter_learning_rate,
-#            global_step=global_step,
-#            decay_steps=500,
-#            decay_rate=0.95,
-#            staircase=True
-#        )
-    learning_rate = FLAGS.starter_learning_rate
+    if FLAGS.exponential_decay:
+        learning_rate = tf.train.exponential_decay(
+                learning_rate=FLAGS.starter_learning_rate,
+                global_step=global_step,
+                decay_steps=FLAGS.decay_steps,
+                decay_rate=FLAGS.decay_rate,
+                staircase=True
+            )
+    else:
+        learning_rate = FLAGS.starter_learning_rate
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
 
@@ -543,7 +550,7 @@ def train():
         restorer = restorer.restore(sess, FLAGS.checkpoint)
         tf.logging.info("checkpoint restored!")
     # value of `global_step' is restored as well
-    saver = tf.train.Saver(all_vars)
+    saver = tf.train.Saver(all_vars, max_to_keep=5000)
 
     idx = sess.run(global_step)
     while idx != FLAGS.num_of_steps:
@@ -612,6 +619,9 @@ def test():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAG.num_of_anchor_boxes == 5:
+        print("Should have 5 anchor boxes in dotcount model.")
+        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
 
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
@@ -702,6 +712,9 @@ def eval():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAG.num_of_anchor_boxes == 5:
+        print("Should have 5 anchor boxes in dotcount model.")
+        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
     _y_gt = tf.placeholder(
                 tf.float32,
@@ -802,8 +815,13 @@ def train_dot_count():
                             only_confidence=True,
                             reuse=tf.AUTO_REUSE
                           )
+    counts = count_persons(_y, FLAGS.infer_threshold)
+
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAGS.num_of_anchor_boxes == 5:
+        print("Should have 5 anchor boxes in dotcount model.")
+        exit()
     _y = pad_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
@@ -828,15 +846,16 @@ def train_dot_count():
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
     tf.summary.scalar("finalloss", loss)
 
-#    starter_learning_rate = 1e-2
-#    learning_rate = tf.train.exponential_decay(
-#            learning_rate=starter_learning_rate,
-#            global_step=global_step,
-#            decay_steps=500,
-#            decay_rate=0.95,
-#            staircase=True
-#        )
-    learning_rate = FLAGS.starter_learning_rate
+    if FLAGS.exponential_decay:
+        learning_rate = tf.train.exponential_decay(
+                learning_rate=FLAGS.starter_learning_rate,
+                global_step=global_step,
+                decay_steps=FLAGS.decay_steps,
+                decay_rate=FLAGS.decay_rate,
+                staircase=True
+            )
+    else:
+        learning_rate = FLAGS.starter_learning_rate
     optimizer = tf.train.AdamOptimizer(learning_rate)
     train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
 
@@ -894,6 +913,8 @@ def train_dot_count():
         exit(1)
     train_writer = tf.summary.FileWriter(FLAGS.train_log_dir, sess.graph)
 
+    eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+
     sess.run(initializer)
 
     if FLAGS.use_checkpoint:
@@ -903,7 +924,7 @@ def train_dot_count():
             restorer = tf.train.Saver(vars_to_restore)
         restorer = restorer.restore(sess, FLAGS.checkpoint)
         tf.logging.info("checkpoint restored!")
-    saver = tf.train.Saver(all_vars)
+    saver = tf.train.Saver(all_vars, max_to_keep=5000)
 
     idx = sess.run(global_step)
     while idx != FLAGS.num_of_steps:
@@ -945,7 +966,8 @@ def train_dot_count():
 
         # NOTE by now, global_step is always == idx+1, because we have do
         # `train_step`...
-        if (idx+1) % 500  == 0:
+        if (idx+1) % 1000  == 0:
+            print("Checkpointing and validating...")
             ckpt_name = os.path.join(FLAGS.train_ckpt_dir, "model.ckpt")
             if not os.path.exists(FLAGS.train_ckpt_dir):
                 os.makedirs(FLAGS.train_ckpt_dir)
@@ -953,6 +975,35 @@ def train_dot_count():
                 print("{} is not a directory.".format(FLAGS.train_ckpt_dir))
                 return -1
             saver.save(sess, ckpt_name, global_step=global_step)
+
+            jdx = 0
+            image_size = 320
+            mae = 0
+            while True:
+                batch_xs, batch_ys, _ = eval_reader.next_batch(
+                                          FLAGS.batch_size,
+                                          image_size=image_size,
+                                          only_person_num=True,
+                                          infinite=False
+                                        )
+                if not len(batch_xs): break
+                sys.stdout.write("Testing batch[{}]...".format(jdx))
+                jdx += 1
+                sys.stdout.flush()
+                start_time = datetime.datetime.now()
+                output_counts = sess.run(counts,
+                                         feed_dict={_x: batch_xs},
+                                         options=run_option)
+                elapsed_time = datetime.datetime.now() - start_time
+                error = cal_mae(output_counts, batch_ys)
+                mae += error
+                sys.stdout.write(
+                  "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
+                )
+            print("\nFinal MAE: {}\n".format(mae/float(jdx)))
+            # re-initiating the reader such that it loop from the beginning
+            eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+
 
         idx += 1
     print("End of training.")
@@ -988,7 +1039,13 @@ def cal_mae(output_counts, ground_truth_counts):
     total_error = 0.0
     for oc, gc in zip(output_counts, ground_truth_counts):
         total_error += abs(oc - gc)
+        print("actual number: {}; detected number {}".format(gc, oc))
     result = total_error / len(output_counts)
+    print("Batch size {}, total error {}, average {}".format(
+                                                        len(output_counts),
+                                                        total_error,
+                                                        result
+                                                    ))
     return result
 
 def eval_dotcount_model():
@@ -1034,7 +1091,7 @@ def eval_dotcount_model():
     restorer = restorer.restore(sess, FLAGS.checkpoint)
     tf.logging.info("checkpoint restored!")
 
-    idx = 1
+    idx = 0
     image_size = 320
     mae = 0
     while True:
@@ -1056,10 +1113,10 @@ def eval_dotcount_model():
         error = cal_mae(output_counts, batch_ys)
         mae += error
         sys.stdout.write(
-            "Prediction time: {} | Current mae: {}\n".format(elapsed_time, mae)
+          "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
         )
 
-    print("\nFinal MAE: {}\n".format(mae))
+    print("\nFinal MAE: {}\n".format(mae/float(idx)))
 
 def main(_):
 
