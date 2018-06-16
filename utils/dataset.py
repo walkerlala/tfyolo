@@ -52,6 +52,9 @@ class DatasetReader():
                         )
                 self.label_classname[parts[0]] = parts[1]
 
+    def get_class_names(self):
+        return self.label_classname.values()
+
     def _get_cell_ij(self, x, y, image_size):
         """Get corresponding cell x/y coordinates of @gt_box (which cell it
         belongs in the final feature map) """
@@ -76,19 +79,21 @@ class DatasetReader():
         gt_bnxs[cell_i][cell_j].append(box)
         return gt_bnxs
 
-    def _pack_and_flatten_gt_box(self, gt_bnxs, image_size, num_gt_bnx_per_cell):
+    def _pack_and_flatten_gt_box(self, gt_bnxs, image_size, num_gt_bnx):
         feature_map_len = image_size/32
         for i in range(feature_map_len):
             for j in range(feature_map_len):
                 num_box = len(gt_bnxs[i][j])
-                assert num_box <= num_gt_bnx_per_cell, \
+                assert num_box <= num_gt_bnx, \
                         "Number of box[%d] exceed in cell[%d][%d] \
-                         (with num_gt_bnx_per_cell[%d]). \
-                         Consider incresing FLAGS.num_gt_bnx_per_cell." \
-                         % (num_box, i, j, num_gt_bnx_per_cell)
-                for k in range(num_gt_bnx_per_cell-num_box):
+                         (with num_gt_bnx[%d]). \
+                         Consider incresing FLAGS.num_gt_bnx." \
+                         % (num_box, i, j, num_gt_bnx)
+                for k in range(num_gt_bnx-num_box):
                     gt_bnxs[i][j].append([0,0,0,0,0])
-        gt_bnxs = np.array(gt_bnxs).reshape((feature_map_len, feature_map_len, 5*num_gt_bnx_per_cell))
+        gt_bnxs = np.array(gt_bnxs).reshape(
+                    (feature_map_len, feature_map_len, 5*num_gt_bnx)
+                  )
         return gt_bnxs
 
     @staticmethod
@@ -108,7 +113,7 @@ class DatasetReader():
                 outscale[i][j].append(row_num)
         return outscale
 
-    def next_batch(self, batch_size=50, image_size=320, num_gt_bnx_per_cell=20,
+    def next_batch(self, batch_size=50, image_size=320, num_gt_bnx=20,
                    normalize_image=True, infinite=True):
         """ Return next batch of images.
 
@@ -116,7 +121,7 @@ class DatasetReader():
             batch_size: Number of images to return.
             image_size: Size of image. If the loaded image is not in this size,
                 then it will be resized to [image_size, image_size, 3].
-            num_gt_bnx_per_cell: See FLAGS.num_gt_bnx_per_cell.
+            num_gt_bnx: See FLAGS.num_gt_bnx.
             normalize_image: To or to not normalize the image (to [0, 1]).
             infinite: Whether or not to loop all images infinitely.
 
@@ -125,7 +130,7 @@ class DatasetReader():
                       [batch_size, image_size, image_size, 3]
             batch_ys: A batch of ground truth bounding box value.
                 It is in shape
-                    [batch_size, image_size/32, image_size/32, 5*num_gt_bnx_per_cell]
+                    [batch_size, image_size/32, image_size/32, 5*num_gt_bnx]
             outscale: Scale information (of x/y coordinates) for this batch.
         """
         assert image_size % 32 == 0, "image_size should be multiple of 32"
@@ -211,8 +216,15 @@ class DatasetReader():
                 y /= cell_size
 
                 box = [label, x, y, w, h]
-                gt_bnxs = self._append_gt_box(gt_bnxs, box, image_size, cell_i, cell_j)
-                assert cell_i<image_size/32 and cell_j<image_size/32, "cell_i/j too large"
+                gt_bnxs = self._append_gt_box(
+                            gt_bnxs,
+                            box,
+                            image_size,
+                            cell_i,
+                            cell_j
+                        )
+                assert cell_i<image_size/32 and cell_j<image_size/32, \
+                       "cell_i/j too large"
 
             if not len(gt_bnxs):
                 print("WARNING: image[{}] has no label!".format(x_path))
@@ -220,7 +232,7 @@ class DatasetReader():
                                 for j in range(int(image_size/32))]
 
             gt_bnxs = self._pack_and_flatten_gt_box(gt_bnxs, image_size,
-                                                    num_gt_bnx_per_cell)
+                                                    num_gt_bnx)
             batch_ys.append(gt_bnxs)
             yfile.close()
 
@@ -233,7 +245,7 @@ class DatasetReader():
                   % (str(batch_xs.shape), str(batch_xs_shape))
 
         batch_ys_shape = (batch_size, image_size/32,
-                          image_size/32, 5*num_gt_bnx_per_cell)
+                          image_size/32, 5*num_gt_bnx)
         assert batch_ys.shape == batch_ys_shape, \
                 "batch_ys shape mismatch. shape: %s, expected: %s" \
                   % (str(batch_ys.shape), str(batch_ys_shape))
@@ -241,145 +253,6 @@ class DatasetReader():
         outscale = DatasetReader.get_outscale(image_size)
 
         return batch_xs, batch_ys, outscale
-
-    def _pack_gt_box_dotcount(self, gt_bnxs, num_gt_bnx):
-        """ . """
-        l = len(gt_bnxs)
-        if l > num_gt_bnx:
-            raise ValueError("number of ground truth boxes[{}] exceeded. "
-                             "Consider increase FLAGS.num_gt_bnx.".format(l))
-        for _ in range(num_gt_bnx-l):
-            gt_bnxs.append([0,0,0,0,0])
-        return gt_bnxs
-
-    def next_batch_dotcount(self, batch_size=50, image_size=320,
-                            only_person_num=False, num_gt_bnx=200,
-                            normalize_image=True, infinite=True):
-        """ Return next batch of images for the dotcount model.
-
-          Args:
-            batch_size: Number of images to return.
-            image_size: Size of image. If the loaded image is not in this size,
-                then it will be resized to [image_size, image_size, 3].
-            only_person_num: If True, return only the number of persons in batch_ys.
-            num_gt_bnx: See FLAGS.num_gt_bnx.
-            normalize_image: To or to not normalize the image (to [0, 1]).
-            infinite: Whether or not to loop all images infinitely.
-
-          Return:
-            batch_xs: A batch of image, i.e., a numpy array in shape
-                      [batch_size, image_size, image_size, 3]
-            batch_ys: A batch of ground truth bounding box value, or just the
-                numbers of persons.
-                In shape
-                    [batch_size, num_gt_bnx*5]
-                or
-                    TODO
-        """
-        assert image_size % 32 == 0, "image_size should be multiple of 32"
-
-        batch_xs_filename = []
-        for _ in range(batch_size):
-            filename = next(self._images_list_iter, None)
-            if not filename:
-                if not infinite:
-                    if not len(batch_xs_filename):
-                        return ([], [], None)
-                    elif len(batch_xs_filename):
-                        batch_size = len(batch_xs_filename)
-                        break
-                self._images_list_iter = iter(self._images_list)
-                filename = next(self._images_list_iter)
-            batch_xs_filename.append(filename)
-        random.shuffle(batch_xs_filename)
-
-        batch_ys_filename = []
-        for path in batch_xs_filename:
-            batch_ys_filename.append(path.replace('jpg', 'txt'))
-
-        batch_xs = []
-        batch_ys = []
-        for x_path, y_path in zip(batch_xs_filename, batch_ys_filename):
-            orignal_image = cv2.imread(x_path)
-            height, weight, channel = orignal_image.shape
-            # INTER_NEAREST - a nearest-neighbor interpolation
-            # INTER_LINEAR - a bilinear interpolation (used by default)
-            # INTER_AREA - resampling using pixel area relation. It may be a preferred
-            #              method for image decimation, as it gives moire’-free results
-            #              But when the image is zoomed, it is similar to the INTER_NEAREST
-            #              method.
-            # INTER_CUBIC - a bicubic interpolation over 4x4 pixel neighborhood
-            # INTER_LANCZOS4 - a Lanczos interpolation over 8x8 pixel neighborhood
-            im = cv2.resize(orignal_image, dsize=(image_size, image_size),
-                            interpolation=cv2.INTER_LINEAR)
-            if normalize_image:
-                # TODO I don't know what exactly is the 2nd parameter for
-                im = cv2.normalize(np.asarray(im, np.float32), np.array([]),
-                                   alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
-            batch_xs.append(im)
-
-            yfile = open(y_path, "r")
-
-            if only_person_num:
-                cnts = 0
-                for line in yfile:
-                    line = line.strip()
-                    if line:
-                        cnts += 1
-                batch_ys.append(cnts)
-                yfile.close()
-                continue
-
-            gt_bnxs = []
-            for line in yfile:
-                line = line.strip()
-                if not len(line) or line.startswith('#'): continue
-                parts = line.split()
-                if len(parts) != 5:
-                    raise ValueError("Invalid label format in %s: %s" % (path, line))
-                label, x, y, w, h = parts
-                # NOTE we don't have to scale the coordinates, because a point
-                # at 0.7 in the original image would also appear at 0.7 at the
-                # scaled image.
-                label = float(label)
-                x = float(x) # x coordinate of the box center
-                y = float(y) # y coordinate of the box center
-                w = float(w) # width of the box
-                h = float(h) # height of the box
-                # Some label at COCO dataset has 1.000 as width/height
-                if not (x<=1 and y<=1 and w<=1 and h<=1):
-                    print("WRONG DATA. [x,y,w,h]: %s, [_x,_y,_w,_h]: %s, y_path:%s" % (
-                          str([x,y,w,h]), str([_x,_y,_w,_h]), y_path))
-                    continue
-                if not (w>0 and h > 0):
-                    print("WRONG DATA. w&h must > 0. w&h: %s, y_path:%s" % (
-                          str([w,h]), y_path))
-                    continue
-                if x==0 or y==0:
-                    print("WARNING: x|y == 0, x&y: %s, y_path:%s" % (str[x, y], y_path))
-
-                box = [label, x, y, w, h]
-                gt_bnxs.append(box)
-
-            gt_bnxs = self._pack_gt_box_dotcount(gt_bnxs, num_gt_bnx)
-            batch_ys.append(gt_bnxs)
-            yfile.close()
-
-        batch_xs = np.array(batch_xs)
-        batch_ys = np.array(batch_ys)
-        batch_ys = np.reshape(batch_ys, [-1, num_gt_bnx*5])
-
-        batch_xs_shape = (batch_size, image_size, image_size, 3)
-        assert batch_xs.shape == batch_xs_shape, \
-                "batch_xs shape mismatch. shape: %s, expected: %s" \
-                  % (str(batch_xs.shape), str(batch_xs_shape))
-
-        batch_ys_shape = (batch_size, ) if only_person_num else (batch_size, num_gt_bnx*5)
-        assert batch_ys.shape == batch_ys_shape, \
-                "batch_ys shape mismatch. shape: %s, expected: %s" \
-                  % (str(batch_ys.shape), str(batch_ys_shape))
-
-        return batch_xs, batch_ys
 
 class ImageHandler():
     """Image handler for testing."""
@@ -404,17 +277,17 @@ class ImageHandler():
         """Read a batch of images after scaling and normalization.
 
           Args:
-              batch_size: Number of images to read. If there are not enough images,
-                whatever number of images left will be returned (that is, the number
-                of images returned maybe < @batch_size.
+              batch_size: Number of images to read. If there are not enough
+                images, whatever number of images left will be returned (that
+                is, the number of images returned may be < @batch_size.
               scale: All image will be scaled to shape of [scale, scale].
           Return:
               images: A batch of images after scaling and normalization.
-              original_sizes: Size/shape of the images before scaling and normalization.
-              names: Basename of the images.
-              outscale: Scale info for some functions to scale the prediction output
-                to be relative to the whole image (rather than relative to the current
-                cell).
+              original_sizes: Size/shape of the images before scaling and
+                normalization.
+              outscale: Scale info for some functions to scale the prediction
+                output to be relative to the whole image (rather than relative
+                to the current cell).
         """
         images = []
         names = []

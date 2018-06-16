@@ -5,45 +5,54 @@ import datetime
 import os
 import pdb
 import sys
-import cv2
-import copy
 import numpy as np
 import tensorflow as tf
+from tensorflow.python.ops import control_flow_ops
 from utils.dataset import DatasetReader
 from utils.dataset import ImageHandler
-from utils.metrics import map_batch
+from utils.visualization_utils import draw_bounding_box_on_image_array
 from networks.yolovx import YOLOvx
 from networks.yolovx import YOLOLoss
-from networks.yolovx import DotcountLoss
-from tensorflow.python.ops import control_flow_ops
 
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
-tf.app.flags.DEFINE_boolean("train", False, "To train or not to train.")
-tf.app.flags.DEFINE_boolean("dotcount", False, "To train the Dotcount model.")
-tf.app.flags.DEFINE_boolean("test", False, "To test or not to test.")
-tf.app.flags.DEFINE_boolean("evaluate", False, "To evaluate or not to evaluate.")
-tf.app.flags.DEFINE_boolean("multiple_images", False, "Predict for multiple images.")
+tf.app.flags.DEFINE_boolean("train", False, "To train or not.")
+tf.app.flags.DEFINE_boolean("test", False, "To test/predict or not.")
+tf.app.flags.DEFINE_boolean("evaluate", False, "To evaluate or not.")
+tf.app.flags.DEFINE_boolean("multiple_images", False,
+        "Predict for multiple images.")
 
 tf.app.flags.DEFINE_string("infile", "Image.jpg", "The image to predict.")
 tf.app.flags.DEFINE_alias("test_files_list", "infile")
-tf.app.flags.DEFINE_string("outfile", "Prediction.jpg", "Output path of the predictions.")
+tf.app.flags.DEFINE_string("outfile", "Prediction.jpg",
+        "Output path of the predictions.")
 tf.app.flags.DEFINE_alias("outdir", "outfile")
+# NOTE
+#   1. Lable files should be put in the same directory and in the YOLO format
+#   2. Empty line and lines that start with # will be ignore.
+#      (But # at the end will not. Careful!)
+tf.app.flags.DEFINE_string("train_files_list",
+        "/disk1/labeled/roomonly_train.txt",
+        "File which contains all images for training.")
+tf.app.flags.DEFINE_string("eval_files_list",
+        "/disk1/labeled/roomonly_valid.txt",
+        "File which contains all images for evaluation.")
 
 tf.app.flags.DEFINE_boolean("freeze_backbone", False,
         "Freeze the backbone network or not")
 
-# TODO mark some args as co-exist, and backbone_arch should have limited choice
-tf.app.flags.DEFINE_boolean("use_checkpoint", True, "To use or not to use checkpoint.")
+tf.app.flags.DEFINE_boolean("use_checkpoint", True,
+        "To use or not to use checkpoint.")
 tf.app.flags.DEFINE_string("checkpoint", "./vgg_16.ckpt",
         "Path of checkpoint file. Must come with its parent dir name, "
         "even it is in the current directory (eg, ./model.ckpt).")
 tf.app.flags.DEFINE_boolean("restore_all_variables", False,
         "Whether or not to restore all variables. Default to False, which "
         "means restore only variables for the backbone network")
-tf.app.flags.DEFINE_string("backbone_arch", "vgg_16",
-        "Avaliable backbone architecture are 'vgg_16' and 'inception_v1'")
+tf.app.flags.DEFINE_string("backbone_arch", "inception_v1",
+        "The backbone network architecture to use. "
+        "Available backbones are 'inception_v1', 'vgg_16', 'resnet_v2' .")
 tf.app.flags.DEFINE_alias("backbone", "backbone_arch")
 
 tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolockpts/",
@@ -68,17 +77,6 @@ tf.app.flags.DEFINE_integer("num_anchor_boxes", 5,
 
 tf.app.flags.DEFINE_integer("summary_steps", 100, "Write summary ever X steps")
 
-# NOTE
-#   1. Lable files should be put in the same directory and in the YOLO format
-#   2. Empty line and lines that start with # will be ignore.
-#      (But # at the end will not. Careful!)
-tf.app.flags.DEFINE_string("train_files_list",
-        "/disk1/labeled/roomonly_train.txt",
-        "File which contains all images for training.")
-tf.app.flags.DEFINE_string("eval_files_list",
-        "/disk1/labeled/roomonly_valid.txt",
-        "File which contains all images for evaluation.")
-
 # Format of this file should be:
 #
 #   0 person
@@ -88,14 +86,13 @@ tf.app.flags.DEFINE_string("eval_files_list",
 #
 # Empty line and lines that start with # will be ignore.
 # (But # at the end will not. Careful!)
-# TODO we are now ignoring class information (predict only for persons)
 tf.app.flags.DEFINE_string("class_name_file", "/disk1/labeled/classnames.txt",
         "File which contains id <=> classname mapping.")
 
 tf.app.flags.DEFINE_integer("image_size_min", 320,
         "The minimum size of a image (i.e., image_size_min * image_size_min).")
 
-tf.app.flags.DEFINE_integer("num_image_scales", 10,
+tf.app.flags.DEFINE_integer("num_image_scales", 1,
         "Number of scales used to preprocess images. We want different size of "
         "input to our network to bring up its generality.")
 
@@ -107,12 +104,7 @@ tf.app.flags.DEFINE_integer("num_gt_bnx_per_cell", 20,
         "Numer of ground truth bounding box per feature map cell. "
         "If there are not enough ground truth bouding boxes, "
         "some number of fake boxes will be padded.")
-tf.app.flags.DEFINE_integer("num_gt_bnx_per_image", 200,
-        "Number of ground truth bounding box per image. "
-        "This flag is for the Dotcound model. "
-        "If there are not enough ground truth bounding boxes, "
-        "some number of fake boxes will be padded.")
-tf.app.flags.DEFINE_alias("num_gt_bnx", "num_gt_bnx_per_image")
+tf.app.flags.DEFINE_alias("num_gt_bnx", "num_gt_bnx_per_cell")
 
 tf.app.flags.DEFINE_integer("num_steps", 20000,
         "Max num of step. -1 makes it infinite.")
@@ -182,7 +174,7 @@ def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
                     [output_shape[0], output_shape[1], output_shape[2], -1])
     return output
 
-def scale_ground_truth(ground_truth, outscale, num_gt_bnx_per_cell):
+def scale_ground_truth(ground_truth, outscale, num_gt_bnx):
     """Similar to scale_output(), except that it operates on ground_truth labels
     instead of output labels"""
 
@@ -210,8 +202,8 @@ def scale_ground_truth(ground_truth, outscale, num_gt_bnx_per_cell):
             )
     # [None, None, 1, 5]
     outscale_add = tf.expand_dims(outscale_add, axis=-2)
-    # [None, None, num_gt_bnx_per_cell, 5]
-    outscale_add = tf.tile(outscale_add, [1,1,num_gt_bnx_per_cell,1])
+    # [None, None, num_gt_bnx, 5]
+    outscale_add = tf.tile(outscale_add, [1,1,num_gt_bnx,1])
 
     outscale_div_shape = tf.shape(outscale_div_part)
     outscale_div_pad_lhs = tf.ones(
@@ -227,27 +219,72 @@ def scale_ground_truth(ground_truth, outscale, num_gt_bnx_per_cell):
             axis=-1
             )
     outscale_div = tf.expand_dims(outscale_div, axis=-2)
-    outscale_div = tf.tile(outscale_div, [1,1,num_gt_bnx_per_cell,1])
+    outscale_div = tf.tile(outscale_div, [1, 1, num_gt_bnx, 1])
 
     ground_truth_shape = tf.shape(ground_truth)
     ground_truth = tf.reshape(
             ground_truth,
-            [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2],
-             num_gt_bnx_per_cell, 5])
+            [ground_truth_shape[0], ground_truth_shape[1],
+             ground_truth_shape[2], num_gt_bnx, 5]
+        )
 
     ground_truth = ground_truth / outscale_div + outscale_add
-    ground_truth = tf.reshape(ground_truth,
-            [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2], -1])
+    ground_truth = tf.reshape(
+            ground_truth,
+            [ground_truth_shape[0], ground_truth_shape[1],
+             ground_truth_shape[2], -1]
+        )
     return ground_truth
 
+def draw_bounding_boxes(images, output, class_names):
+    """Draw bouding boxes of 'output' on 'images'.
+
+      Args:
+        images: [None, None, None, 3]
+        output: [None, None, 5+num_classes]
+        class_names: list of names.
+      Return:
+        result: Images with bounding boxes on it.
+    """
+    colors = ['red', 'blue', 'green']
+
+    # define as inner function to share variables
+    def draw_bounding_boxes_fn(images, output):
+        for img, ops in zip(images, output):
+            for op in ops:
+                ymin, xmin, ymax, xmax = op[0:4]
+                cls_id = np.argmax(op[5:])
+                color = colors[cls_id % len(colors)]
+                #TODO test len(class_names)
+                name = [ class_names[cls_id] ]
+                draw_bounding_box_on_image_array(
+                        img,
+                        ymin,
+                        xmin,
+                        ymax,
+                        xmax,
+                        color=color,
+                        display_str_list=name,
+                        use_normalized_coordinates=True
+                    )
+
+        return images
+    # --- END ---
+    result = tf.py_func(draw_bounding_boxes_fn, [images, output], tf.float32)
+    return result
+
 def non_max_suppression_single(output_piece):
-    """Perform non max suppression on a single image. """
+    """Perform non max suppression on a single image.
+
+    Note that we perform non max suppression regardless of classness, that is,
+    if bounding boxes of two class have a high IoU, one will be suppressed.
+    """
     # non-max suppression
     selected_indices = tf.image.non_max_suppression(
                         output_piece[...,0:4],
                         output_piece[..., 4],
                         max_output_size=10000,
-                        iou_threshold=0.5
+                        iou_threshold=0.6
                     )
     # mask non-selected box
     one_hot = tf.one_hot(
@@ -268,25 +305,27 @@ def non_max_suppression_batch(output):
              )
     return result
 
-def validation(output, images, num_anchor_boxes, num_classes=0,
-          infer_threshold=0.6):
+def validation(output, images, num_anchor_boxes, num_classes=1,
+        class_names=['person'], infer_threshold=0.6):
     """
-        Args:
-         output: output of YOLOvx network, shape:
-            [-1, -1, -1, num_anchor_boxes * (5+num_classes)]
+      Args:
+       output: output of YOLOvx network, shape:
+          [-1, -1, -1, num_anchor_boxes * (5+num_classes)]
 
-            Note, the x/y coordinates from the original neural network output are
-            relative to the the corresponding cell. Here we expect them to be
-            already scaled to relative to the whole image (i.e., used scale_output())
+          Note, the x/y coordinates from the original neural network output are
+          relative to the the corresponding cell. Here we expect them to be
+          already scaled to relative to the whole image (i.e., using
+          scale_output())
 
-         images: input images, shape [None, None, None, 3]
-         infer_threshold: See FLAGS.infer_threshold.
-         num_anchor_boxes: See FLAGS.num_anchor_boxes.
-         num_classes: See FLAGS.num_classes.
-         only_xy: Whether @output only include x/y coordinates.
+       images: input images, shape [None, None, None, 3]
+       infer_threshold: See FLAGS.infer_threshold.
+       num_anchor_boxes: See FLAGS.num_anchor_boxes.
+       num_classes: See FLAGS.num_classes.
+       class_names: List of class names.
+       infer_threshold: See FLAGS.infer_threshold.
 
-        Return:
-         result: A copy of @images with prediction bounding box on it.
+      Return:
+       result: A copy of @images with prediction bounding box on it.
     """
     with tf.variable_scope("validation_scope"):
         output_shape = tf.shape(output)
@@ -294,16 +333,11 @@ def validation(output, images, num_anchor_boxes, num_classes=0,
 
         output = tf.reshape(
                     output,
-                    [-1,
-                     num_anchor_boxes*output_row_num*output_row_num,
-                     5+num_classes]
+                    [-1, num_anchor_boxes*(output_row_num**2), 5+num_classes]
                 )
 
-        # get P(class) = P(object) * P(class|object)
-        # p_class = output[:, :, 5:] * tf.expand_dims(output[:, :, 4], -1)
-        # output = tf.concat([output[:, :, 0:5], p_class], axis=-1)
-
-        # mask all bounding boxes whose objectness values are less than threshold.
+        # mask all bounding boxes whose objectness values are less than
+        # threshold.
         output_idx = output[..., 4]
         mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
         mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
@@ -325,20 +359,27 @@ def validation(output, images, num_anchor_boxes, num_classes=0,
 
         output = non_max_suppression_batch(output)
 
-        result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
+        #TODO
+        #Using tf.py_func to draw bounding boxes on images is too costly
+        #probably because of the data-transfer between CPU and GPU.
+        # result = draw_bounding_boxes(images, output, class_names)
+        result = tf.image.draw_bounding_boxes(images, output)
         return result
 
 def build_images_with_bboxes(*args, **kwargs):
     return validation(*args, **kwargs)
 
-def build_images_with_ground_truth(ground_truth, images, num_gt_bnx_per_cell):
+def build_images_with_ground_truth(ground_truth, images, num_gt_bnx,
+        class_names=['person']):
     """Put ground truth boxes on images.
 
       Args:
         ground_truth: [batch_size,
                             feature_map_len,
-                                feature_map_len, num_gt_bnx_per_cell*5]
+                                feature_map_len, num_gt_bnx*5]
         images: [batch_size, image_size, image_size, 3]
+        num_gt_bnx: See FLAGS.num_gt_bnx.
+        class_names: List of class names.
 
       Return:
           result: Images with ground truth bounding boxes on it.
@@ -347,21 +388,28 @@ def build_images_with_ground_truth(ground_truth, images, num_gt_bnx_per_cell):
         feature_map_len = tf.shape(images)[1]/32
         ground_truth = tf.reshape(
                             ground_truth,
-                            [-1, num_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
+                            [-1, num_gt_bnx*(feature_map_len**2), 5]
                         )
+        cls = ground_truth[..., 0:1]
         x = ground_truth[..., 1:2]
         y = ground_truth[..., 2:3]
         w = ground_truth[..., 3:4]
         h = ground_truth[..., 4:5]
+        #pad boxes with a fake confidence value and cls value so that it has
+        #the same shape as in validation().
         boxes = tf.concat([
                     y - h/2, # ymin
                     x - w/2, # xmin
                     y + h/2, # ymax
-                    x + w/2  # xmax
+                    x + w/2, # xmax
+                    cls,
+                    cls
                 ],
                 axis=-1
             )
-        result = tf.image.draw_bounding_boxes(images, boxes, name="ground_truth_on_images")
+
+        # result = draw_bounding_boxes(images, boxes, class_names)
+        result = tf.image.draw_bounding_boxes(images, boxes)
         return result
 
 def fit_anchor_boxes(output, num_anchor_boxes, anchors):
@@ -395,7 +443,10 @@ def fit_anchor_boxes(output, num_anchor_boxes, anchors):
         fit_hs = tf.maximum(tf.minimum(tf.sigmoid(hs), 0.999), 0.01)
         fit_obj = tf.sigmoid(obj)
 
-        return tf.concat([fit_xs, fit_ys, fit_ws, fit_hs, fit_obj, left], axis=-1)
+        return tf.concat(
+                  [fit_xs, fit_ys, fit_ws, fit_hs, fit_obj, left],
+                  axis=-1
+               )
     # -- END --
     splits = tf.split(output, num_anchor_boxes, axis=-1)
     fit = []
@@ -427,14 +478,11 @@ def train():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_anchor_boxes == 5:
-        print("Should have 5 anchor boxes in dotcount model.")
-        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
                 tf.float32,
-                [None, None, None, 5*FLAGS.num_gt_bnx_per_cell]
+                [None, None, None, 5*FLAGS.num_gt_bnx]
             )
 
     global_step = tf.Variable(0, name='self_global_step',
@@ -450,11 +498,10 @@ def train():
                   batch_size=FLAGS.batch_size,
                   num_anchor_boxes=FLAGS.num_anchor_boxes,
                   num_classes=FLAGS.num_classes,
-                  num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
+                  num_gt_bnx=FLAGS.num_gt_bnx,
                   global_step=global_step
                 )
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
-    tf.summary.scalar("finalloss", loss)
 
     if FLAGS.exponential_decay:
         learning_rate = tf.train.exponential_decay(
@@ -467,12 +514,22 @@ def train():
     else:
         learning_rate = FLAGS.starter_learning_rate
     optimizer = tf.train.AdamOptimizer(learning_rate)
-    train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
+    train_step = slim.learning.create_train_op(
+                    loss,
+                    optimizer,
+                    global_step=global_step
+                 )
 
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     if update_ops:
         updates = tf.group(*update_ops)
         loss = control_flow_ops.with_dependencies([updates], loss)
+
+    # load images and labels
+    reader = DatasetReader(FLAGS.train_files_list, FLAGS.class_name_file)
+    class_names = reader.get_class_names()
+    #TODO we should make output_scale_placeholder a plain numpy array instead
+    #of a tensor.
 
     # scale x/y coordinates of output of the neural network to be relative of
     # the whole image.
@@ -481,13 +538,14 @@ def train():
                     _y,
                     output_scale_placeholder,
                     num_anchor_boxes=FLAGS.num_anchor_boxes,
-                    num_classes=FLASG.num_classes
+                    num_classes=FLAGS.num_classes
                )
     validation_images = validation(
                             output=y_scaled,
                             images=_x,
                             num_anchor_boxes=FLAGS.num_anchor_boxes,
                             num_classes=FLAGS.num_classes,
+                            class_names=class_names,
                             infer_threshold=FLAGS.infer_threshold
                         )
     tf.summary.image("validation_images", validation_images, max_outputs=3)
@@ -495,19 +553,17 @@ def train():
     gt_scaled = scale_ground_truth(
                     _y_gt,
                     output_scale_placeholder,
-                    num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell
+                    num_gt_bnx=FLAGS.num_gt_bnx
                 )
-    images_with_grouth_boxes = build_images_with_ground_truth(
-                                    ground_truth=gt_scaled,
-                                    images=_x,
-                                    num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell
-                                )
-    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
+    images_with_gt_boxes = build_images_with_ground_truth(
+                                   ground_truth=gt_scaled,
+                                   images=_x,
+                                   num_gt_bnx=FLAGS.num_gt_bnx,
+                                   class_names=class_names
+                               )
+    tf.summary.image("images_with_gt_boxes", images_with_gt_boxes, max_outputs=3)
 
     tf.logging.info("All network loss/train_step built! Yah!")
-
-    # load images and labels
-    reader = DatasetReader(FLAGS.train_files_list, FLAGS.class_name_file)
 
     initializer = tf.global_variables_initializer()
 
@@ -519,7 +575,7 @@ def train():
     if not os.path.exists(FLAGS.train_log_dir):
         os.makedirs(FLAGS.train_log_dir)
     elif not os.path.isdir(FLAGS.train_log_dir):
-        print("{} already exists and is not a dir. Exit.".format(FLAGS.train_log_dir))
+        print("{} already exists and is not a dir.".format(FLAGS.train_log_dir))
         exit(1)
     train_writer = tf.summary.FileWriter(FLAGS.train_log_dir, sess.graph)
 
@@ -548,25 +604,35 @@ def train():
          outscale) = reader.next_batch(
                        batch_size=FLAGS.batch_size,
                        image_size=image_size,
-                       num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
+                       num_gt_bnx=FLAGS.num_gt_bnx,
                        infinite=True
                      )
 
         sys.stdout.write("Running train_step[{}]...".format(idx))
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        train_summary, loss_val,_1,_2 = \
+        loss_val,_1, = \
             sess.run(
-                [merged_summary, loss, train_step, validation_images],
+                [loss, train_step],
                 feed_dict={
                     _x: batch_xs,
                     _y_gt: batch_ys,
-                    output_scale_placeholder: outscale},
+                    output_scale_placeholder: outscale
+                },
                 options=run_option,
-                # run_metadata=run_metadata,
             )
         # validate per `summary_steps' iterations
         if idx % FLAGS.summary_steps == 0:
+            train_summary = \
+                sess.run(
+                    merged_summary,
+                    feed_dict={
+                        _x: batch_xs,
+                        _y_gt: batch_ys,
+                        output_scale_placeholder: outscale
+                    },
+                    options=run_option,
+                )
             train_writer.add_summary(train_summary, idx)
 
         elapsed_time = datetime.datetime.now() - start_time
@@ -602,9 +668,6 @@ def test():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_anchor_boxes == 5:
-        print("Should have 5 anchor boxes in dotcount model.")
-        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
@@ -650,7 +713,7 @@ def test():
     idx = 1
     while True:
         (batch_xs, batch_xs_scale_info,
-            batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+         batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
         if not len(batch_xs): break
         sys.stdout.write("Testing batch[{}]...".format(idx))
         idx += 1
@@ -695,13 +758,10 @@ def eval():
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_anchor_boxes == 5:
-        print("Should have 5 anchor boxes in dotcount model.")
-        exit()
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
     _y_gt = tf.placeholder(
                 tf.float32,
-                [None, None, None, 5*FLAGS.num_gt_bnx_per_cell]
+                [None, None, None, 5*FLAGS.num_gt_bnx]
             )
 
     # restore all variables
@@ -732,7 +792,7 @@ def eval():
          outscale) = reader.next_batch(
                        batch_size=FLAGS.batch_size,
                        image_size=image_size,
-                       num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
+                       num_gt_bnx=FLAGS.num_gt_bnx,
                        infinite=False
                      )
         if not batch_xs: break
@@ -755,533 +815,6 @@ def eval():
     mAP = map_batch(op_batch, gt_batch, FLAGS.infer_threshold)
     print("mAP: {}".format(mAP))
 
-#######################################################
-#                  Dotcount model
-######################################################
-def validation_dotcount(output, images, num_anchor_boxes, infer_threshold=0.6):
-    """Validate the dotcount model.
-
-      Args:
-          output: [batch_size, num_anchor_boxes*4].
-          images: [batch_size, -1, -1, 3].
-          num_anchor_boxes: See FLAGS.num_anchor_boxes.
-          infer_threshold: See infer_threshold.
-      Return:
-          None
-    """
-    with tf.variable_scope("dotcount_validation"):
-        shape = tf.shape(output)
-        output = tf.reshape(output, [-1, num_anchor_boxes, 4])
-        # pad output with w/h of 0.1 so that it is visible on images.
-        output_pad_wh = tf.ones(
-                [shape[0], num_anchor_boxes, 2],
-                dtype=tf.float32
-            )
-        output_pad_wh = output_pad_wh * 0.1
-        #[batch_size, num_anchor_boxes, 6]
-        output = tf.concat(
-                [output[..., 0:2], output_pad_wh, output[..., 2:]],
-                axis=-1
-            )
-
-        output_idx = output[..., 4]
-        mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
-        mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
-        masked_output = output * mask
-        # NOTE now we just draw all the box, regardless of its classes.
-        boxes_x = masked_output[..., 0:1]
-        boxes_y = masked_output[..., 1:2]
-        boxes_w = masked_output[..., 2:3]
-        boxes_h = masked_output[..., 3:4]
-        output_rhs = masked_output[..., 4:]
-        output = tf.concat([
-                boxes_y - boxes_h/2, # ymin
-                boxes_x - boxes_w/2, # xmin
-                boxes_y + boxes_h/2, # ymax
-                boxes_x + boxes_w/2, # xmax
-                output_rhs],
-                axis=-1
-            )
-
-        # make them inner funcs to share variables
-        def _get_indices_single_pic(idx):
-            """ Get index of n/s/w/e/nw/ne/sw/se boxes."""
-            assert idx >= 0 and idx < num_anchor_boxes, \
-                "idx should be in range!"
-            row_num = int(num_anchor_boxes**0.5)
-            #north
-            idx_n = idx - row_num
-            if idx_n < 0:
-                idx_n = -1
-            #north-west
-            idx_nw = idx - row_num - 1
-            if idx_nw < 0 or idx % row_num==0:
-                idx_nw = -1
-            #north-east
-            idx_ne = idx - row_num + 1
-            if  idx_ne < 0 or (idx+1) % row_num==0:
-                idx_ne = -1
-            #south
-            idx_s = idx + row_num
-            if idx_s >= num_anchor_boxes:
-                idx_s = -1
-            #south-west
-            idx_sw = idx + row_num - 1
-            if idx_sw >= num_anchor_boxes or idx % row_num==0:
-                idx_sw = -1
-            #south-east
-            idx_se = idx + row_num + 1
-            if idx_se >= num_anchor_boxes or (idx+1) % row_num==0:
-                idx_se = -1
-            #west
-            idx_w = idx - 1
-            if idx % row_num == 0:
-                idx_w = -1
-            #east
-            idx_e = idx + 1
-            if (idx + 1) % row_num == 0:
-                idx_e = -1
-
-            return (idx_n, idx_s, idx_w, idx_e, idx_nw, idx_ne, idx_sw, idx_se)
-
-        def _dotcount_nms(output):
-            """A tf.py_func to perform non-max suppression on the output of the
-            dotcount model.
-
-              Args:
-                  output: [batch_size, num_anchor_boxes, 6]
-              Return:
-                  output: Output after non-max suppression.
-            """
-            output = copy.deepcopy(output)
-            for pic in output:
-                #pic in shape [num_anchor_boxes, 6]
-                maxs = np.argsort(pic, axis=0, kind='quicksort')[::-1]
-                for idxs in maxs:
-                    idx = idxs[4]
-                    if pic[idx][4] == 0:
-                        continue
-                    # print("pic[idx]: " + str(pic[idx]))
-                    if pic[idx][5] > 0.5: #TODO
-                        idx_nswe = _get_indices_single_pic(idx)
-                        for idx2 in idx_nswe:
-                            if idx2 >=0:
-                                pic[idx2] = np.array([0,0,0,0,0,0])
-            return output
-
-        result_no_nms = tf.image.draw_bounding_boxes(images, output)
-
-        output = tf.py_func(_dotcount_nms, [output], tf.float32, stateful=True)
-        result_nms = tf.image.draw_bounding_boxes(images, output)
-        return result_nms, result_no_nms
-
-def build_images_with_ground_truth_dotcount(ground_truth, images, num_gt_bnx):
-    """Put ground truth boxes on images.
-
-      Args:
-        ground_truth: [batch_size, num_gt_bnx*5]
-        images: [batch_size, image_size, image_size, 3]
-
-      Return:
-          result: Images with ground truth bounding boxes on it.
-    """
-    with tf.variable_scope("dotcount_ground_truth"):
-        ground_truth = tf.reshape(ground_truth, [-1, num_gt_bnx, 5])
-        x = ground_truth[..., 1:2]
-        y = ground_truth[..., 2:3]
-        w = ground_truth[..., 3:4]
-        h = ground_truth[..., 4:5]
-        boxes = tf.concat([
-                    y - h/2, # ymin
-                    x - w/2, # xmin
-                    y + h/2, # ymax
-                    x + w/2  # xmax
-                ],
-                axis=-1
-            )
-        result = tf.image.draw_bounding_boxes(images, boxes,
-                                              name="ground_truth_on_images")
-        return result
-
-def generate_anchors(num_anchor_boxes):
-    """Generate anchor boxes coordinates x/y.
-
-      Args:
-          num_anchor_boxes: See FLAGS.num_anchor_boxes.
-      Return:
-          coordinates x/y in shape [num_anchor_boxes, 2].
-    """
-    # This is not quite accurate, but I don't want it too complicated.
-    assert int(num_anchor_boxes**0.5)**2 == int(num_anchor_boxes),\
-            "num_anchor_boxes should be square of some integer!"
-    row_num = int(num_anchor_boxes**0.5)
-    def _gen_splits(row_num, start=0.0, end=1.0):
-        assert row_num >= 1, "row_num must >= 1"
-        assert (start >=0.0 and start <=end and end <=1.0), "fuck!"
-        if row_num == 1:
-            return np.asarray([(start+end)/2.0])
-        if row_num == 2:
-            l = end-start
-            return np.asarray([start+0.25*l, start+0.75*l])
-        if row_num == 3:
-            l = end-start
-            return np.asarray([start+0.25*l, start+0.5*l, start+0.75*l])
-        middle = (start+end)/2.0
-        lhs = _gen_splits(int(row_num/2), start=start, end=middle)
-        rhs = _gen_splits(int(row_num/2), start=middle, end=end)
-        if row_num % 2 != 0:
-            lhs = np.concatenate([lhs, [0.5]], axis=-1)
-        res = np.concatenate([lhs, rhs], axis=-1)
-        return res
-    # --END--
-    x = _gen_splits(row_num)
-    xx = np.tile(x, [row_num, 1])
-    xx = np.expand_dims(xx, axis=-1)
-    y = _gen_splits(row_num)[::-1]
-    yy = np.tile(y, [row_num, 1])
-    yy = np.transpose(yy)
-    yy = np.expand_dims(yy, axis=-1)
-    result = np.concatenate([xx, yy], axis=-1)
-    return np.reshape(result, [-1, 2])
-
-def pad_anchor_boxes(output, num_anchor_boxes, anchors):
-    """Pad the output from the neural network, which only has the confidence
-    value, with x/y coordinates of pre-defined anchor boxes.
-
-      Args:
-        output: Computed output from the network. In shape
-          [batch_size, num_anchor_boxes*2]
-        num_anchor_boxes: See FLAGS.num_anchor_boxes.
-        anchors: Pre-defined anchor boxes, in shape [num_anchor_boxes, 2]
-      Return:
-        result: Output padded with x/y coordinates of corresponding anchor
-          boxes, in shape [batch_size, num_anchor_boxes*4]
-    """
-    splits = tf.split(output, num_anchor_boxes, axis=-1)
-    fit = []
-    for anchor, split in zip(anchors, splits):
-        split_xy = anchor * tf.ones_like(split)
-        obj = tf.sigmoid(split)
-        fit.append(tf.concat([split_xy, obj], axis=-1))
-    result = tf.concat(fit, axis=-1)
-    return result
-
-def train_dot_count():
-    """Train the Dotcount network."""
-
-    variable_sizes = []
-    for i in range(FLAGS.num_image_scales):
-        variable_sizes.append(FLAGS.image_size_min + i*32)
-
-    tf.logging.info("Building tensorflow graph...")
-
-    _x = tf.placeholder(tf.float32, [None, None, None, 3])
-    #_y in shape [batch_size, num_anchor_boxes*2]
-    _y, vars_to_restore = YOLOvx(
-                            _x,
-                            backbone_arch=FLAGS.backbone_arch,
-                            num_anchor_boxes=FLAGS.num_anchor_boxes,
-                            freeze_backbone=FLAGS.freeze_backbone,
-                            only_confidence=True,
-                            reuse=tf.AUTO_REUSE
-                          )
-    # counts = count_persons(_y, FLAGS.infer_threshold)
-
-    # This is not quite accurate, but I don't want it too complicated.
-    assert int(FLAGS.num_anchor_boxes**0.5)**2 == int(FLAGS.num_anchor_boxes),\
-            "num_anchor_boxes should be square of some integer!"
-    anchors = generate_anchors(FLAGS.num_anchor_boxes)
-    #_y in shape [batch_size, num_anchor_boxes*4]
-    _y = pad_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
-
-    _y_gt = tf.placeholder(
-                tf.float32,
-                [None, FLAGS.num_gt_bnx*5]
-            )
-
-    global_step = tf.Variable(0, name='self_global_step',
-                              trainable=False, dtype=tf.int32)
-
-    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-    all_vars.extend(vars_to_restore)
-    all_vars = list(set(all_vars))
-    all_vars.append(global_step)
-
-    losscal = DotcountLoss(
-                  batch_size=FLAGS.batch_size,
-                  num_anchor_boxes=FLAGS.num_anchor_boxes,
-                  num_gt_bnx=FLAGS.num_gt_bnx,
-                  global_step=global_step
-                )
-    loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
-    tf.summary.scalar("finalloss", loss)
-
-    if FLAGS.exponential_decay:
-        learning_rate = tf.train.exponential_decay(
-                learning_rate=FLAGS.starter_learning_rate,
-                global_step=global_step,
-                decay_steps=FLAGS.decay_steps,
-                decay_rate=FLAGS.decay_rate,
-                staircase=True
-            )
-    else:
-        learning_rate = FLAGS.starter_learning_rate
-    optimizer = tf.train.AdamOptimizer(learning_rate)
-    train_step = slim.learning.create_train_op(loss, optimizer, global_step=global_step)
-
-    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
-    if update_ops:
-        updates = tf.group(*update_ops)
-        loss = control_flow_ops.with_dependencies([updates], loss)
-
-    (validation_nms, validation_no_nms) = validation_dotcount(
-                            output=_y,
-                            images=_x,
-                            num_anchor_boxes=FLAGS.num_anchor_boxes,
-                            infer_threshold=FLAGS.infer_threshold
-                        )
-    tf.summary.image("validation_nms", validation_nms, max_outputs=3)
-    tf.summary.image("validation_no_nms", validation_no_nms, max_outputs=3)
-
-    images_with_grouth_boxes = build_images_with_ground_truth_dotcount(
-                                    ground_truth=_y_gt,
-                                    images=_x,
-                                    num_gt_bnx=FLAGS.num_gt_bnx
-                                )
-    tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
-
-    tf.logging.info("All network loss/train_step built! Yah!")
-
-    # load images and labels
-    reader = DatasetReader(FLAGS.train_files_list, FLAGS.class_name_file)
-
-    initializer = tf.global_variables_initializer()
-
-    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
-                                            log_device_placement=False))
-
-    merged_summary = tf.summary.merge_all()
-    if not os.path.exists(FLAGS.train_log_dir):
-        os.makedirs(FLAGS.train_log_dir)
-    elif not os.path.isdir(FLAGS.train_log_dir):
-        print("{} already exists and is not a dir. Exit.".format(FLAGS.train_log_dir))
-        exit(1)
-    train_writer = tf.summary.FileWriter(FLAGS.train_log_dir, sess.graph)
-
-    # eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
-
-    sess.run(initializer)
-
-    if FLAGS.use_checkpoint:
-        if FLAGS.restore_all_variables:
-            restorer = tf.train.Saver(all_vars)
-        else:
-            restorer = tf.train.Saver(vars_to_restore)
-        restorer = restorer.restore(sess, FLAGS.checkpoint)
-        tf.logging.info("checkpoint restored!")
-    saver = tf.train.Saver(all_vars, max_to_keep=5000)
-
-    idx = sess.run(global_step)
-    while idx != FLAGS.num_steps:
-        # Change size every 100 steps.
-        # `size' is the size of input image, not the final feature map size.
-        image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
-        if idx % 100 == 0 and idx:
-            print("Switching to another image size: %d" % image_size)
-
-        (batch_xs, batch_ys) = reader.next_batch_dotcount(
-                                    batch_size=FLAGS.batch_size,
-                                    image_size=image_size,
-                                    num_gt_bnx=FLAGS.num_gt_bnx,
-                                    infinite=True
-                               )
-
-        sys.stdout.write("Running train_step[{}]...".format(idx))
-        sys.stdout.flush()
-        start_time = datetime.datetime.now()
-        loss_val,_1 = \
-            sess.run(
-                [loss, train_step],
-                feed_dict={
-                    _x: batch_xs,
-                    _y_gt: batch_ys
-                    },
-                options=run_option,
-            )
-        # validate per `summary_steps' iterations
-        if idx % FLAGS.summary_steps == 0:
-            train_summary, _1, _2 = sess.run(
-                    [merged_summary, validation_nms, validation_no_nms],
-                    feed_dict={
-                        _x: batch_xs,
-                        _y_gt: batch_ys
-                    },
-                    options=run_option,
-                )
-            train_writer.add_summary(train_summary, idx)
-
-        elapsed_time = datetime.datetime.now() - start_time
-        sys.stdout.write(
-          "Elapsed time: {}, LossVal: {:10.10f}\n".format(elapsed_time, loss_val)
-        )
-
-        # NOTE by now, global_step is always == idx+1, because we have do
-        # `train_step`...
-        if (idx+1) % 1000  == 0:
-            print("Checkpointing and validating...")
-            ckpt_name = os.path.join(FLAGS.train_ckpt_dir, "model.ckpt")
-            if not os.path.exists(FLAGS.train_ckpt_dir):
-                os.makedirs(FLAGS.train_ckpt_dir)
-            elif not os.path.isdir(FLAGS.train_ckpt_dir):
-                print("{} is not a directory.".format(FLAGS.train_ckpt_dir))
-                return -1
-            saver.save(sess, ckpt_name, global_step=global_step)
-
-            #jdx = 0
-            #image_size = 320
-            #mae = 0
-            #while True:
-            #    batch_xs, batch_ys, _ = eval_reader.next_batch_dotcount(
-            #                              FLAGS.batch_size,
-            #                              image_size=image_size,
-            #                              only_person_num=True,
-            #                              infinite=False
-            #                            )
-            #    if not len(batch_xs): break
-            #    sys.stdout.write("Testing batch[{}]...".format(jdx))
-            #    jdx += 1
-            #    sys.stdout.flush()
-            #    start_time = datetime.datetime.now()
-            #    output_counts = sess.run(counts,
-            #                             feed_dict={_x: batch_xs},
-            #                             options=run_option)
-            #    elapsed_time = datetime.datetime.now() - start_time
-            #    error = cal_mae(output_counts, batch_ys)
-            #    mae += error
-            #    sys.stdout.write(
-            #      "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
-            #    )
-            #print("\nFinal MAE: {}\n".format(mae/float(jdx)))
-            ## re-initiating the reader such that it loop from the beginning
-            #eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
-
-
-        idx += 1
-    print("End of training.")
-
-def count_persons(output, infer_threshold):
-    """Count the number of predictions whose confidence is higher than
-    @infer_threshold.
-
-      Args:
-          output: Output of the neural network. In shape
-            [batch_size, image_size/32, image_size/32, num_anchor_boxes]
-          infer_threshold: See FLAGS.infer_threshold.
-      Return:
-          result: Number of persons in each image. In shape
-            [batch_size, 1]
-    """
-    #TODO use tf.sigmoid() !!!
-    shape = tf.shape(output)
-    output = tf.reshape(output, [shape[0], -1])
-    output = tf.cast(tf.greater(output, infer_threshold), tf.int32)
-    result = tf.reduce_sum(output, axis=1)
-    return result
-
-def cal_mae(output_counts, ground_truth_counts):
-    """Calculater MAE in batch.
-
-      Args:
-          output_counts: A numpy array of shape [batch_size, ].
-          ground_truth_counts: A numpy array of shape [batch_size, ].
-      Return:
-          mae: the average mae.
-    """
-    assert np.shape(output_counts) == np.shape(ground_truth_counts), \
-            "Shape mismatch!!"
-    total_error = 0.0
-    for oc, gc in zip(output_counts, ground_truth_counts):
-        total_error += abs(oc - gc)
-        print("actual number: {}; detected number {}".format(gc, oc))
-    result = total_error / len(output_counts)
-    print("Batch size {}, total error {}, average {}".format(
-                                                        len(output_counts),
-                                                        total_error,
-                                                        result
-                                                    ))
-    return result
-
-#def eval_dotcount_model():
-#    """Evaluate the dotcount model using MAE (mean absolute error)."""
-#
-#    tf.logging.info("Building tensorflow graph...")
-#
-#    _x = tf.placeholder(tf.float32, [None, None, None, 3])
-#    _y, vars_to_restore = YOLOvx(
-#                            _x,
-#                            backbone_arch=FLAGS.backbone_arch,
-#                            num_anchor_boxes=FLAGS.num_anchor_boxes,
-#                            freeze_backbone=True,
-#                            only_confidence=True,
-#                            reuse=tf.AUTO_REUSE
-#                          )
-#    counts = count_persons(_y, FLAGS.infer_threshold)
-#
-#    _y_gt = tf.placeholder(tf.int32, [None, 1])
-#
-#    global_step = tf.Variable(0, name='self_global_step',
-#                              trainable=False, dtype=tf.int32)
-#
-#    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-#    all_vars.extend(vars_to_restore)
-#    all_vars = list(set(all_vars))
-#    all_vars.append(global_step)
-#
-#    tf.logging.info("All network loss/train_step built! Yah!")
-#
-#    # load images and labels
-#    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
-#
-#    initializer = tf.global_variables_initializer()
-#
-#    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
-#    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
-#                                            log_device_placement=False))
-#
-#    sess.run(initializer)
-#
-#    restorer = tf.train.Saver(all_vars)
-#    restorer = restorer.restore(sess, FLAGS.checkpoint)
-#    tf.logging.info("checkpoint restored!")
-#
-#    idx = 0
-#    image_size = 320
-#    mae = 0
-#    while True:
-#        batch_xs, batch_ys, _ = reader.next_batch_dotcount(
-#                                  FLAGS.batch_size,
-#                                  image_size=image_size,
-#                                  only_person_num=True,
-#                                  infinite=False
-#                                )
-#        if not len(batch_xs): break
-#        sys.stdout.write("Testing batch[{}]...".format(idx))
-#        idx += 1
-#        sys.stdout.flush()
-#        start_time = datetime.datetime.now()
-#        output_counts = sess.run(counts,
-#                                 feed_dict={_x: batch_xs},
-#                                 options=run_option)
-#        elapsed_time = datetime.datetime.now() - start_time
-#        error = cal_mae(output_counts, batch_ys)
-#        mae += error
-#        sys.stdout.write(
-#          "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
-#        )
-#
-#    print("\nFinal MAE: {}\n".format(mae/float(idx)))
-
 def main(_):
 
     if FLAGS.train and FLAGS.test:
@@ -1292,17 +825,14 @@ def main(_):
 
     if FLAGS.train:
         tf.logging.info("Started in training mode. Starting to train...")
-        if not FLAGS.dotcount:
-            train()
-        else:
-            train_dot_count()
+        train()
     elif FLAGS.test:
         tf.logging.info("Started in testing mode...")
         test()
     elif FLAGS.evaluate:
         tf.logging.info("Started in eval mode...")
-        if FLAGS.dotcount:
-            eval_dotcount_model()
+    else:
+        tf.logging.info("What are you going to do (train/test/evaluate)?")
 
 if __name__ == '__main__':
     tf.app.run()
