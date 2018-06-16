@@ -711,36 +711,43 @@ def test():
     tf.logging.info("checkpoint restored!")
 
     idx = 1
-    while True:
-        (batch_xs, batch_xs_scale_info,
-         batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
-        if not len(batch_xs): break
-        sys.stdout.write("Testing batch[{}]...".format(idx))
-        idx += 1
-        sys.stdout.flush()
-        start_time = datetime.datetime.now()
-        final_images = sess.run(images_with_bboxes,
-                                feed_dict={
-                                    _x: batch_xs,
-                                    output_scale_placeholder: outscale
-                                },
-                                options=run_option)
-        elapsed_time = datetime.datetime.now() - start_time
-        sys.stdout.write(
-          "Prediction time: {} | Writing images...".format(elapsed_time)
-        )
+    # trace/dump/profile at step one
+    with tf.contrib.tfprof.ProfileContext('/tmp/profile_dir',
+                                          trace_steps=[0],
+                                          dump_steps=[0]) as pctx:
+        opts = tf.profiler.ProfileOptionBuilder.float_operation()
+        pctx.add_auto_profiling('op', opts, [0])
 
-        image_handler.write_batch(
-                        final_images,
-                        batch_xs_scale_info,
-                        batch_xs_names,
-                        FLAGS.multiple_images,
-                        FLAGS.outdir,
-                        FLAGS.outfile
-                      )
+        while True:
+            (batch_xs, batch_xs_scale_info,
+             batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+            if not len(batch_xs): break
+            sys.stdout.write("Testing batch[{}]...".format(idx))
+            idx += 1
+            sys.stdout.flush()
+            start_time = datetime.datetime.now()
+            final_images = sess.run(images_with_bboxes,
+                                    feed_dict={
+                                        _x: batch_xs,
+                                        output_scale_placeholder: outscale
+                                    },
+                                    options=run_option)
+            elapsed_time = datetime.datetime.now() - start_time
+            sys.stdout.write(
+              "Prediction time: {} | Writing images...".format(elapsed_time)
+            )
 
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+            image_handler.write_batch(
+                            final_images,
+                            batch_xs_scale_info,
+                            batch_xs_names,
+                            FLAGS.multiple_images,
+                            FLAGS.outdir,
+                            FLAGS.outfile
+                          )
+
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 def eval():
     """Evaluate the current model (compute mAP and the like)."""

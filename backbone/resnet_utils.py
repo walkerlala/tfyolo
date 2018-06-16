@@ -223,7 +223,7 @@ def resnet_arg_scope(weight_decay=0.0001,
                      batch_norm_decay=0.997,
                      batch_norm_epsilon=1e-5,
                      batch_norm_scale=True,
-                     activation_fn=tf.nn.relu,
+                     activation_fn=tf.nn.leaky_relu,
                      use_batch_norm=True):
   """Defines the default ResNet arg scope.
 

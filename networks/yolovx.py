@@ -18,6 +18,8 @@ from backbone.vgg import vgg_16
 from backbone.vgg import vgg_arg_scope
 from backbone.resnet_v2 import resnet_v2_101
 from backbone.resnet_v2 import resnet_arg_scope
+from backbone.vx import vx
+from backbone.vx import vx_arg_scope
 
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
@@ -38,7 +40,14 @@ def backbone_network(images, backbone_arch, reuse):
                                             reuse=reuse
                                         )
         vars_to_restore = slim.get_variables_to_restore()
-
+    elif backbone_arch == 'vx':
+        with slim.arg_scope(vx_arg_scope()):
+            backbone_network, endpoints = vx(
+                                            images,
+                                            is_training=not freeze_backbone,
+                                            reuse=reuse
+                                        )
+            vars_to_restore = slim.get_variables_to_restore()
     elif backbone_arch == 'vgg_16':
         with slim.arg_scope(vgg_arg_scope()):
             backbone_network, endpoints = vgg_16(
@@ -61,7 +70,7 @@ def backbone_network(images, backbone_arch, reuse):
                                             reuse=reuse)
         vars_to_restore = slim.get_variables_to_restore()
     else:
-        raise ValueError("No backbone network: {}".format(backbone_arch))
+        raise ValueError("No backbone network {} available.".format(backbone_arch))
 
     return backbone_network, vars_to_restore
 
