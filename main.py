@@ -6,6 +6,7 @@ import os
 import pdb
 import sys
 import cv2
+import copy
 import numpy as np
 import tensorflow as tf
 from utils.dataset import DatasetReader
@@ -57,12 +58,12 @@ tf.app.flags.DEFINE_float("decay_rate", 0.95, "")
 
 tf.app.flags.DEFINE_integer("batch_size", 64, "Batch size.")
 
-tf.app.flags.DEFINE_integer("num_of_classes", 1, "Number of classes.")
+tf.app.flags.DEFINE_integer("num_classes", 1, "Number of classes.")
 
 tf.app.flags.DEFINE_float("infer_threshold", 0.6, "Objectness threshold")
 
 # NOTE We don't do any clustering for this. Just use 5 as a heuristic.
-tf.app.flags.DEFINE_integer("num_of_anchor_boxes", 5,
+tf.app.flags.DEFINE_integer("num_anchor_boxes", 5,
         "Number of anchor boxes.")
 
 tf.app.flags.DEFINE_integer("summary_steps", 100, "Write summary ever X steps")
@@ -94,7 +95,7 @@ tf.app.flags.DEFINE_string("class_name_file", "/disk1/labeled/classnames.txt",
 tf.app.flags.DEFINE_integer("image_size_min", 320,
         "The minimum size of a image (i.e., image_size_min * image_size_min).")
 
-tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
+tf.app.flags.DEFINE_integer("num_image_scales", 10,
         "Number of scales used to preprocess images. We want different size of "
         "input to our network to bring up its generality.")
 
@@ -102,39 +103,45 @@ tf.app.flags.DEFINE_integer("num_of_image_scales", 10,
 # up your life ;-). So we pack each cell with a fixed number of ground truth
 # bounding box (even though there is not that many ground truth bounding box
 # at that cell). See code at "utils/dataset.py"
-tf.app.flags.DEFINE_integer("num_of_gt_bnx_per_cell", 20,
+tf.app.flags.DEFINE_integer("num_gt_bnx_per_cell", 20,
         "Numer of ground truth bounding box per feature map cell. "
         "If there are not enough ground truth bouding boxes, "
         "some number of fake boxes will be padded.")
+tf.app.flags.DEFINE_integer("num_gt_bnx_per_image", 200,
+        "Number of ground truth bounding box per image. "
+        "This flag is for the Dotcound model. "
+        "If there are not enough ground truth bounding boxes, "
+        "some number of fake boxes will be padded.")
+tf.app.flags.DEFINE_alias("num_gt_bnx", "num_gt_bnx_per_image")
 
-tf.app.flags.DEFINE_integer("num_of_steps", 20000,
+tf.app.flags.DEFINE_integer("num_steps", 20000,
         "Max num of step. -1 makes it infinite.")
 
 FLAGS = tf.app.flags.FLAGS
 
 tf.logging.set_verbosity(tf.logging.DEBUG)
 
-def scale_output(output, outscale, num_of_anchor_boxes, num_of_classes=None,
+def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
                  only_xy=False):
     """ Scale x/y coordinates to be relative to the whole image.
 
         Args:
           output: YOLOvx network output, shape
-            [None, None, None, num_of_anchor_boxes*X],
-            where X is "(5+num_of_classes)" or "3", depending on whether
+            [None, None, None, num_anchor_boxes*X],
+            where X is "(5+num_classes)" or "3", depending on whether
             @only_xy is False or True.
           outscale: [None, None, 3], the first dimension is against the
             second dimension of @output, the second dimension is against
             the third dimension of @output (that is, we do it across the
             whole batch).
-          num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
-          num_of_classes: See FLAGS.num_of_classes.
+          num_anchor_boxes: See FLAGS.num_anchor_boxes.
+          num_classes: See FLAGS.num_classes.
           only_xy: Whether @output only include x/y coordinates.
 
         Return:
           output: the scaled output.
     """
-    xy_pad_num = 1 if only_xy else 3+num_of_classes
+    xy_pad_num = 1 if only_xy else 3+num_classes
 
     # [None, None, 2]
     outscale_add_part = outscale[..., 0:2]
@@ -147,12 +154,12 @@ def scale_output(output, outscale, num_of_anchor_boxes, num_of_classes=None,
                [outscale_add_shape[0], outscale_add_shape[1], xy_pad_num],
                dtype=tf.float32
             )
-    # [None, None, 5+num_of_classes]
+    # [None, None, 5+num_classes]
     outscale_add = tf.concat([outscale_add_part, outscale_add_pad], axis=-1)
-    # [None, None, 1, 5+num_of_classes]
+    # [None, None, 1, 5+num_classes]
     outscale_add = tf.expand_dims(outscale_add, axis=-2)
-    # [None, None, num_of_anchor_boxes, 5+num_of_classes]
-    outscale_add = tf.tile(outscale_add, [1,1,num_of_anchor_boxes,1])
+    # [None, None, num_anchor_boxes, 5+num_classes]
+    outscale_add = tf.tile(outscale_add, [1,1,num_anchor_boxes,1])
 
     outscale_div_shape = tf.shape(outscale_div_part)
     outscale_div_pad = tf.ones(
@@ -161,13 +168,13 @@ def scale_output(output, outscale, num_of_anchor_boxes, num_of_classes=None,
             )
     outscale_div = tf.concat([outscale_div_part, outscale_div_pad], axis=-1)
     outscale_div = tf.expand_dims(outscale_div, axis=-2)
-    outscale_div = tf.tile(outscale_div, [1,1,num_of_anchor_boxes,1])
+    outscale_div = tf.tile(outscale_div, [1,1,num_anchor_boxes,1])
 
     output_shape = tf.shape(output)
     output = tf.reshape(
                 output,
                 [output_shape[0], output_shape[1], output_shape[2],
-                 num_of_anchor_boxes, 2+xy_pad_num])
+                 num_anchor_boxes, 2+xy_pad_num])
 
     output = output / outscale_div + outscale_add
 
@@ -175,7 +182,7 @@ def scale_output(output, outscale, num_of_anchor_boxes, num_of_classes=None,
                     [output_shape[0], output_shape[1], output_shape[2], -1])
     return output
 
-def scale_ground_truth(ground_truth, outscale, num_of_gt_bnx_per_cell):
+def scale_ground_truth(ground_truth, outscale, num_gt_bnx_per_cell):
     """Similar to scale_output(), except that it operates on ground_truth labels
     instead of output labels"""
 
@@ -203,8 +210,8 @@ def scale_ground_truth(ground_truth, outscale, num_of_gt_bnx_per_cell):
             )
     # [None, None, 1, 5]
     outscale_add = tf.expand_dims(outscale_add, axis=-2)
-    # [None, None, num_of_gt_bnx_per_cell, 5]
-    outscale_add = tf.tile(outscale_add, [1,1,num_of_gt_bnx_per_cell,1])
+    # [None, None, num_gt_bnx_per_cell, 5]
+    outscale_add = tf.tile(outscale_add, [1,1,num_gt_bnx_per_cell,1])
 
     outscale_div_shape = tf.shape(outscale_div_part)
     outscale_div_pad_lhs = tf.ones(
@@ -220,13 +227,13 @@ def scale_ground_truth(ground_truth, outscale, num_of_gt_bnx_per_cell):
             axis=-1
             )
     outscale_div = tf.expand_dims(outscale_div, axis=-2)
-    outscale_div = tf.tile(outscale_div, [1,1,num_of_gt_bnx_per_cell,1])
+    outscale_div = tf.tile(outscale_div, [1,1,num_gt_bnx_per_cell,1])
 
     ground_truth_shape = tf.shape(ground_truth)
     ground_truth = tf.reshape(
             ground_truth,
             [ground_truth_shape[0], ground_truth_shape[1], ground_truth_shape[2],
-             num_of_gt_bnx_per_cell, 5])
+             num_gt_bnx_per_cell, 5])
 
     ground_truth = ground_truth / outscale_div + outscale_add
     ground_truth = tf.reshape(ground_truth,
@@ -261,15 +268,12 @@ def non_max_suppression_batch(output):
              )
     return result
 
-def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
-          infer_threshold=0.6, only_xy=False):
+def validation(output, images, num_anchor_boxes, num_classes=0,
+          infer_threshold=0.6):
     """
         Args:
          output: output of YOLOvx network, shape:
-            [-1, -1, -1, num_of_anchor_boxes * (5+num_of_classes)]
-            or
-            [-1, -1, -1, num_of_anchor_boxes * 3]
-            depending on whether @only_xy is False or not.
+            [-1, -1, -1, num_anchor_boxes * (5+num_classes)]
 
             Note, the x/y coordinates from the original neural network output are
             relative to the the corresponding cell. Here we expect them to be
@@ -277,8 +281,8 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
 
          images: input images, shape [None, None, None, 3]
          infer_threshold: See FLAGS.infer_threshold.
-         num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
-         num_of_classes: See FLAGS.num_of_classes.
+         num_anchor_boxes: See FLAGS.num_anchor_boxes.
+         num_classes: See FLAGS.num_classes.
          only_xy: Whether @output only include x/y coordinates.
 
         Return:
@@ -288,31 +292,11 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
         output_shape = tf.shape(output)
         output_row_num = output_shape[1]
 
-        # pad output with w/h of 0.1 and classness of 0 if it only contains x/y
-        if only_xy:
-            output = tf.reshape(
-                      output,
-                      [-1, num_of_anchor_boxes*output_row_num*output_row_num, 3]
-                    )
-            shape = tf.shape(output)
-            output_pad_wh = tf.ones([shape[0], shape[1], 2], dtype=tf.float32)
-            output_pad_wh = output_pad_wh * 0.1
-            if num_of_classes:
-                output_pad_cls = tf.zeros([shape[0], shape[1], num_of_classes],
-                                          dtype=tf.float32)
-                output = tf.concat([outut[..., 0:2], output_pad_wh,
-                                    outut[..., 2:3], output_pad_cls], axis=-1)
-            else:
-                output = tf.concat(
-                            [output[..., 0:2], output_pad_wh, output[..., 2:]],
-                            axis=-1
-                         )
-
         output = tf.reshape(
                     output,
                     [-1,
-                     num_of_anchor_boxes*output_row_num*output_row_num,
-                     5+num_of_classes]
+                     num_anchor_boxes*output_row_num*output_row_num,
+                     5+num_classes]
                 )
 
         # get P(class) = P(object) * P(class|object)
@@ -339,10 +323,7 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
                 axis=-1
             )
 
-        # We don't want non max suppression when evaluating the dotcount model
-        # (the dotcount model should not rely on it)
-        if not only_xy:
-            output = non_max_suppression_batch(output)
+        output = non_max_suppression_batch(output)
 
         result = tf.image.draw_bounding_boxes(images, output, name="predict_on_images")
         return result
@@ -350,12 +331,14 @@ def validation(output, images, num_of_anchor_boxes, num_of_classes=0,
 def build_images_with_bboxes(*args, **kwargs):
     return validation(*args, **kwargs)
 
-def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell):
+def build_images_with_ground_truth(ground_truth, images, num_gt_bnx_per_cell):
     """Put ground truth boxes on images.
 
       Args:
+        ground_truth: [batch_size,
+                            feature_map_len,
+                                feature_map_len, num_gt_bnx_per_cell*5]
         images: [batch_size, image_size, image_size, 3]
-        ground_truth: [batch_size, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
 
       Return:
           result: Images with ground truth bounding boxes on it.
@@ -364,7 +347,7 @@ def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell)
         feature_map_len = tf.shape(images)[1]/32
         ground_truth = tf.reshape(
                             ground_truth,
-                            [-1, num_of_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
+                            [-1, num_gt_bnx_per_cell*feature_map_len*feature_map_len, 5]
                         )
         x = ground_truth[..., 1:2]
         y = ground_truth[..., 2:3]
@@ -381,7 +364,7 @@ def build_images_with_ground_truth(images, ground_truth, num_of_gt_bnx_per_cell)
         result = tf.image.draw_bounding_boxes(images, boxes, name="ground_truth_on_images")
         return result
 
-def fit_anchor_boxes(output, num_of_anchor_boxes, anchors):
+def fit_anchor_boxes(output, num_anchor_boxes, anchors):
     """Fit the output from the neural network to pre-defined anchor boxes.
 
       Args:
@@ -389,8 +372,8 @@ def fit_anchor_boxes(output, num_of_anchor_boxes, anchors):
                 [batch_size,
                     image_size/32,
                         image_size/32,
-                            (num_of_anchor_boxes * (5 + num_of_classes))]
-        num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
+                            (num_anchor_boxes * (5 + num_classes))]
+        num_anchor_boxes: See FLAGS.num_anchor_boxes.
         anchors: Pre-defined anchor boxes.
       Return:
         result: Output after fixed with the corresponding anchor boxes."""
@@ -414,7 +397,7 @@ def fit_anchor_boxes(output, num_of_anchor_boxes, anchors):
 
         return tf.concat([fit_xs, fit_ys, fit_ws, fit_hs, fit_obj, left], axis=-1)
     # -- END --
-    splits = tf.split(output, num_of_anchor_boxes, axis=-1)
+    splits = tf.split(output, num_anchor_boxes, axis=-1)
     fit = []
     for anchor, split in zip(anchors, splits):
         fit.append(_fit_single(anchor, split))
@@ -425,7 +408,7 @@ def train():
     """ Train the YOLOvx network. """
 
     variable_sizes = []
-    for i in range(FLAGS.num_of_image_scales):
+    for i in range(FLAGS.num_image_scales):
         variable_sizes.append(FLAGS.image_size_min + i*32)
 
     tf.logging.info("Building tensorflow graph...")
@@ -437,21 +420,21 @@ def train():
     _y, vars_to_restore = YOLOvx(
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes,
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            num_classes=FLAGS.num_classes,
                             freeze_backbone=FLAGS.freeze_backbone,
                             reuse=tf.AUTO_REUSE
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_of_anchor_boxes == 5:
+    if not FLAG.num_anchor_boxes == 5:
         print("Should have 5 anchor boxes in dotcount model.")
         exit()
-    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
                 tf.float32,
-                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+                [None, None, None, 5*FLAGS.num_gt_bnx_per_cell]
             )
 
     global_step = tf.Variable(0, name='self_global_step',
@@ -465,9 +448,9 @@ def train():
 
     losscal = YOLOLoss(
                   batch_size=FLAGS.batch_size,
-                  num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                  num_of_classes=FLAGS.num_of_classes,
-                  num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                  num_anchor_boxes=FLAGS.num_anchor_boxes,
+                  num_classes=FLAGS.num_classes,
+                  num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
                   global_step=global_step
                 )
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
@@ -497,14 +480,14 @@ def train():
     y_scaled = scale_output(
                     _y,
                     output_scale_placeholder,
-                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                    num_of_classes=FLASG.num_of_classes
+                    num_anchor_boxes=FLAGS.num_anchor_boxes,
+                    num_classes=FLASG.num_classes
                )
     validation_images = validation(
                             output=y_scaled,
                             images=_x,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes,
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            num_classes=FLAGS.num_classes,
                             infer_threshold=FLAGS.infer_threshold
                         )
     tf.summary.image("validation_images", validation_images, max_outputs=3)
@@ -512,12 +495,12 @@ def train():
     gt_scaled = scale_ground_truth(
                     _y_gt,
                     output_scale_placeholder,
-                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
+                    num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell
                 )
     images_with_grouth_boxes = build_images_with_ground_truth(
-                                    _x,
-                                    gt_scaled,
-                                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
+                                    ground_truth=gt_scaled,
+                                    images=_x,
+                                    num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell
                                 )
     tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
@@ -553,7 +536,7 @@ def train():
     saver = tf.train.Saver(all_vars, max_to_keep=5000)
 
     idx = sess.run(global_step)
-    while idx != FLAGS.num_of_steps:
+    while idx != FLAGS.num_steps:
         # Change size every 100 steps.
         # `size' is the size of input image, not the final feature map size.
         image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
@@ -565,7 +548,7 @@ def train():
          outscale) = reader.next_batch(
                        batch_size=FLAGS.batch_size,
                        image_size=image_size,
-                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                       num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
                        infinite=True
                      )
 
@@ -614,28 +597,28 @@ def test():
     _y, vars_to_restore = YOLOvx(
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            num_classes=FLAGS.num_classes
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_of_anchor_boxes == 5:
+    if not FLAG.num_anchor_boxes == 5:
         print("Should have 5 anchor boxes in dotcount model.")
         exit()
-    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
     y_scaled = scale_output(
                     _y,
                     output_scale_placeholder,
-                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                    num_of_classes=FLAGS.num_of_classes
+                    num_anchor_boxes=FLAGS.num_anchor_boxes,
+                    num_classes=FLAGS.num_classes
                )
     images_with_bboxes = build_images_with_bboxes(
                             output=y_scaled,
                             images=_x,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes,
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            num_classes=FLAGS.num_classes,
                             infer_threshold=FLAGS.infer_threshold
                          )
     global_step = tf.Variable(0, name='self_global_step',
@@ -707,18 +690,18 @@ def eval():
     _y, vars_to_restore = YOLOvx(
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            num_of_classes=FLAGS.num_of_classes
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            num_classes=FLAGS.num_classes
                           )
     # TODO should not be hard-coded.
     anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAG.num_of_anchor_boxes == 5:
+    if not FLAG.num_anchor_boxes == 5:
         print("Should have 5 anchor boxes in dotcount model.")
         exit()
-    _y = fit_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
     _y_gt = tf.placeholder(
                 tf.float32,
-                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+                [None, None, None, 5*FLAGS.num_gt_bnx_per_cell]
             )
 
     # restore all variables
@@ -749,7 +732,7 @@ def eval():
          outscale) = reader.next_batch(
                        batch_size=FLAGS.batch_size,
                        image_size=image_size,
-                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                       num_gt_bnx_per_cell=FLAGS.num_gt_bnx_per_cell,
                        infinite=False
                      )
         if not batch_xs: break
@@ -772,61 +755,248 @@ def eval():
     mAP = map_batch(op_batch, gt_batch, FLAGS.infer_threshold)
     print("mAP: {}".format(mAP))
 
-def pad_anchor_boxes(output, num_of_anchor_boxes, anchors):
+#######################################################
+#                  Dotcount model
+######################################################
+def validation_dotcount(output, images, num_anchor_boxes, infer_threshold=0.6):
+    """Validate the dotcount model.
+
+      Args:
+          output: [batch_size, num_anchor_boxes*4].
+          images: [batch_size, -1, -1, 3].
+          num_anchor_boxes: See FLAGS.num_anchor_boxes.
+          infer_threshold: See infer_threshold.
+      Return:
+          None
+    """
+    with tf.variable_scope("dotcount_validation"):
+        shape = tf.shape(output)
+        output = tf.reshape(output, [-1, num_anchor_boxes, 4])
+        # pad output with w/h of 0.1 so that it is visible on images.
+        output_pad_wh = tf.ones(
+                [shape[0], num_anchor_boxes, 2],
+                dtype=tf.float32
+            )
+        output_pad_wh = output_pad_wh * 0.1
+        #[batch_size, num_anchor_boxes, 6]
+        output = tf.concat(
+                [output[..., 0:2], output_pad_wh, output[..., 2:]],
+                axis=-1
+            )
+
+        output_idx = output[..., 4]
+        mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
+        mask = tf.expand_dims(tf.cast(mask, output.dtype), -1)
+        masked_output = output * mask
+        # NOTE now we just draw all the box, regardless of its classes.
+        boxes_x = masked_output[..., 0:1]
+        boxes_y = masked_output[..., 1:2]
+        boxes_w = masked_output[..., 2:3]
+        boxes_h = masked_output[..., 3:4]
+        output_rhs = masked_output[..., 4:]
+        output = tf.concat([
+                boxes_y - boxes_h/2, # ymin
+                boxes_x - boxes_w/2, # xmin
+                boxes_y + boxes_h/2, # ymax
+                boxes_x + boxes_w/2, # xmax
+                output_rhs],
+                axis=-1
+            )
+
+        # make them inner funcs to share variables
+        def _get_indices_single_pic(idx):
+            """ Get index of n/s/w/e/nw/ne/sw/se boxes."""
+            assert idx >= 0 and idx < num_anchor_boxes, \
+                "idx should be in range!"
+            row_num = int(num_anchor_boxes**0.5)
+            #north
+            idx_n = idx - row_num
+            if idx_n < 0:
+                idx_n = -1
+            #north-west
+            idx_nw = idx - row_num - 1
+            if idx_nw < 0 or idx % row_num==0:
+                idx_nw = -1
+            #north-east
+            idx_ne = idx - row_num + 1
+            if  idx_ne < 0 or (idx+1) % row_num==0:
+                idx_ne = -1
+            #south
+            idx_s = idx + row_num
+            if idx_s >= num_anchor_boxes:
+                idx_s = -1
+            #south-west
+            idx_sw = idx + row_num - 1
+            if idx_sw >= num_anchor_boxes or idx % row_num==0:
+                idx_sw = -1
+            #south-east
+            idx_se = idx + row_num + 1
+            if idx_se >= num_anchor_boxes or (idx+1) % row_num==0:
+                idx_se = -1
+            #west
+            idx_w = idx - 1
+            if idx % row_num == 0:
+                idx_w = -1
+            #east
+            idx_e = idx + 1
+            if (idx + 1) % row_num == 0:
+                idx_e = -1
+
+            return (idx_n, idx_s, idx_w, idx_e, idx_nw, idx_ne, idx_sw, idx_se)
+
+        def _dotcount_nms(output):
+            """A tf.py_func to perform non-max suppression on the output of the
+            dotcount model.
+
+              Args:
+                  output: [batch_size, num_anchor_boxes, 6]
+              Return:
+                  output: Output after non-max suppression.
+            """
+            output = copy.deepcopy(output)
+            for pic in output:
+                #pic in shape [num_anchor_boxes, 6]
+                maxs = np.argsort(pic, axis=0, kind='quicksort')[::-1]
+                for idxs in maxs:
+                    idx = idxs[4]
+                    if pic[idx][4] == 0:
+                        continue
+                    # print("pic[idx]: " + str(pic[idx]))
+                    if pic[idx][5] > 0.5: #TODO
+                        idx_nswe = _get_indices_single_pic(idx)
+                        for idx2 in idx_nswe:
+                            if idx2 >=0:
+                                pic[idx2] = np.array([0,0,0,0,0,0])
+            return output
+
+        result_no_nms = tf.image.draw_bounding_boxes(images, output)
+
+        output = tf.py_func(_dotcount_nms, [output], tf.float32, stateful=True)
+        result_nms = tf.image.draw_bounding_boxes(images, output)
+        return result_nms, result_no_nms
+
+def build_images_with_ground_truth_dotcount(ground_truth, images, num_gt_bnx):
+    """Put ground truth boxes on images.
+
+      Args:
+        ground_truth: [batch_size, num_gt_bnx*5]
+        images: [batch_size, image_size, image_size, 3]
+
+      Return:
+          result: Images with ground truth bounding boxes on it.
+    """
+    with tf.variable_scope("dotcount_ground_truth"):
+        ground_truth = tf.reshape(ground_truth, [-1, num_gt_bnx, 5])
+        x = ground_truth[..., 1:2]
+        y = ground_truth[..., 2:3]
+        w = ground_truth[..., 3:4]
+        h = ground_truth[..., 4:5]
+        boxes = tf.concat([
+                    y - h/2, # ymin
+                    x - w/2, # xmin
+                    y + h/2, # ymax
+                    x + w/2  # xmax
+                ],
+                axis=-1
+            )
+        result = tf.image.draw_bounding_boxes(images, boxes,
+                                              name="ground_truth_on_images")
+        return result
+
+def generate_anchors(num_anchor_boxes):
+    """Generate anchor boxes coordinates x/y.
+
+      Args:
+          num_anchor_boxes: See FLAGS.num_anchor_boxes.
+      Return:
+          coordinates x/y in shape [num_anchor_boxes, 2].
+    """
+    # This is not quite accurate, but I don't want it too complicated.
+    assert int(num_anchor_boxes**0.5)**2 == int(num_anchor_boxes),\
+            "num_anchor_boxes should be square of some integer!"
+    row_num = int(num_anchor_boxes**0.5)
+    def _gen_splits(row_num, start=0.0, end=1.0):
+        assert row_num >= 1, "row_num must >= 1"
+        assert (start >=0.0 and start <=end and end <=1.0), "fuck!"
+        if row_num == 1:
+            return np.asarray([(start+end)/2.0])
+        if row_num == 2:
+            l = end-start
+            return np.asarray([start+0.25*l, start+0.75*l])
+        if row_num == 3:
+            l = end-start
+            return np.asarray([start+0.25*l, start+0.5*l, start+0.75*l])
+        middle = (start+end)/2.0
+        lhs = _gen_splits(int(row_num/2), start=start, end=middle)
+        rhs = _gen_splits(int(row_num/2), start=middle, end=end)
+        if row_num % 2 != 0:
+            lhs = np.concatenate([lhs, [0.5]], axis=-1)
+        res = np.concatenate([lhs, rhs], axis=-1)
+        return res
+    # --END--
+    x = _gen_splits(row_num)
+    xx = np.tile(x, [row_num, 1])
+    xx = np.expand_dims(xx, axis=-1)
+    y = _gen_splits(row_num)[::-1]
+    yy = np.tile(y, [row_num, 1])
+    yy = np.transpose(yy)
+    yy = np.expand_dims(yy, axis=-1)
+    result = np.concatenate([xx, yy], axis=-1)
+    return np.reshape(result, [-1, 2])
+
+def pad_anchor_boxes(output, num_anchor_boxes, anchors):
     """Pad the output from the neural network, which only has the confidence
     value, with x/y coordinates of pre-defined anchor boxes.
 
       Args:
         output: Computed output from the network. In shape
-                [batch_size,
-                    image_size/32,
-                        image_size/32,
-                            num_of_anchor_boxes]
-        num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
-        anchors: Pre-defined anchor boxes.
+          [batch_size, num_anchor_boxes*2]
+        num_anchor_boxes: See FLAGS.num_anchor_boxes.
+        anchors: Pre-defined anchor boxes, in shape [num_anchor_boxes, 2]
       Return:
-        result: Output padded with x/y coordinates of corresponding anchor boxes.
+        result: Output padded with x/y coordinates of corresponding anchor
+          boxes, in shape [batch_size, num_anchor_boxes*4]
     """
-    splits = tf.split(output, num_of_anchor_boxes, axis=-1)
+    splits = tf.split(output, num_anchor_boxes, axis=-1)
     fit = []
     for anchor, split in zip(anchors, splits):
-        split_x = tf.ones_like(split) * anchor[0]
-        split_y = tf.ones_like(split) * anchor[1]
+        split_xy = anchor * tf.ones_like(split)
         obj = tf.sigmoid(split)
-        fit.append(tf.concat([split_x, split_y, obj], axis=-1))
+        fit.append(tf.concat([split_xy, obj], axis=-1))
     result = tf.concat(fit, axis=-1)
     return result
 
 def train_dot_count():
-    """Train the YOLOvx-dotcount network."""
+    """Train the Dotcount network."""
 
     variable_sizes = []
-    for i in range(FLAGS.num_of_image_scales):
+    for i in range(FLAGS.num_image_scales):
         variable_sizes.append(FLAGS.image_size_min + i*32)
 
     tf.logging.info("Building tensorflow graph...")
 
     _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    #_y in shape [batch_size, num_anchor_boxes*2]
     _y, vars_to_restore = YOLOvx(
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
                             freeze_backbone=FLAGS.freeze_backbone,
                             only_confidence=True,
                             reuse=tf.AUTO_REUSE
                           )
-    counts = count_persons(_y, FLAGS.infer_threshold)
+    # counts = count_persons(_y, FLAGS.infer_threshold)
 
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
-    if not FLAGS.num_of_anchor_boxes == 5:
-        print("Should have 5 anchor boxes in dotcount model.")
-        exit()
-    _y = pad_anchor_boxes(_y, FLAGS.num_of_anchor_boxes, anchors)
+    # This is not quite accurate, but I don't want it too complicated.
+    assert int(FLAGS.num_anchor_boxes**0.5)**2 == int(FLAGS.num_anchor_boxes),\
+            "num_anchor_boxes should be square of some integer!"
+    anchors = generate_anchors(FLAGS.num_anchor_boxes)
+    #_y in shape [batch_size, num_anchor_boxes*4]
+    _y = pad_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
                 tf.float32,
-                [None, None, None, 5*FLAGS.num_of_gt_bnx_per_cell]
+                [None, FLAGS.num_gt_bnx*5]
             )
 
     global_step = tf.Variable(0, name='self_global_step',
@@ -839,8 +1009,8 @@ def train_dot_count():
 
     losscal = DotcountLoss(
                   batch_size=FLAGS.batch_size,
-                  num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                  num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
+                  num_anchor_boxes=FLAGS.num_anchor_boxes,
+                  num_gt_bnx=FLAGS.num_gt_bnx,
                   global_step=global_step
                 )
     loss = losscal.calculate_loss(output = _y, ground_truth = _y_gt)
@@ -864,33 +1034,19 @@ def train_dot_count():
         updates = tf.group(*update_ops)
         loss = control_flow_ops.with_dependencies([updates], loss)
 
-    # scale x/y coordinates of output of the neural network to be relative of
-    # the whole image.
-    output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
-    y_scaled = scale_output(
-                    _y,
-                    output_scale_placeholder,
-                    num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                    only_xy=True
-               )
-    validation_images = validation(
-                            output=y_scaled,
+    (validation_nms, validation_no_nms) = validation_dotcount(
+                            output=_y,
                             images=_x,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            infer_threshold=FLAGS.infer_threshold,
-                            only_xy=True
+                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+                            infer_threshold=FLAGS.infer_threshold
                         )
-    tf.summary.image("validation_images", validation_images, max_outputs=3)
+    tf.summary.image("validation_nms", validation_nms, max_outputs=3)
+    tf.summary.image("validation_no_nms", validation_no_nms, max_outputs=3)
 
-    gt_scaled = scale_ground_truth(
-                    _y_gt,
-                    output_scale_placeholder,
-                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
-                )
-    images_with_grouth_boxes = build_images_with_ground_truth(
-                                    _x,
-                                    gt_scaled,
-                                    num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell
+    images_with_grouth_boxes = build_images_with_ground_truth_dotcount(
+                                    ground_truth=_y_gt,
+                                    images=_x,
+                                    num_gt_bnx=FLAGS.num_gt_bnx
                                 )
     tf.summary.image("images_with_grouth_boxes", images_with_grouth_boxes, max_outputs=3)
 
@@ -913,7 +1069,7 @@ def train_dot_count():
         exit(1)
     train_writer = tf.summary.FileWriter(FLAGS.train_log_dir, sess.graph)
 
-    eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+    # eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
 
     sess.run(initializer)
 
@@ -927,36 +1083,42 @@ def train_dot_count():
     saver = tf.train.Saver(all_vars, max_to_keep=5000)
 
     idx = sess.run(global_step)
-    while idx != FLAGS.num_of_steps:
+    while idx != FLAGS.num_steps:
         # Change size every 100 steps.
         # `size' is the size of input image, not the final feature map size.
         image_size = variable_sizes[(idx / 100) % len(variable_sizes)]
         if idx % 100 == 0 and idx:
             print("Switching to another image size: %d" % image_size)
 
-        (batch_xs,
-         batch_ys,
-         outscale) = reader.next_batch(
-                       batch_size=FLAGS.batch_size,
-                       image_size=image_size,
-                       num_of_gt_bnx_per_cell=FLAGS.num_of_gt_bnx_per_cell,
-                       infinite=True
-                     )
+        (batch_xs, batch_ys) = reader.next_batch_dotcount(
+                                    batch_size=FLAGS.batch_size,
+                                    image_size=image_size,
+                                    num_gt_bnx=FLAGS.num_gt_bnx,
+                                    infinite=True
+                               )
 
         sys.stdout.write("Running train_step[{}]...".format(idx))
         sys.stdout.flush()
         start_time = datetime.datetime.now()
-        train_summary, loss_val,_1,_2 = \
+        loss_val,_1 = \
             sess.run(
-                [merged_summary, loss, train_step, validation_images],
+                [loss, train_step],
                 feed_dict={
                     _x: batch_xs,
-                    _y_gt: batch_ys,
-                    output_scale_placeholder: outscale},
+                    _y_gt: batch_ys
+                    },
                 options=run_option,
             )
         # validate per `summary_steps' iterations
         if idx % FLAGS.summary_steps == 0:
+            train_summary, _1, _2 = sess.run(
+                    [merged_summary, validation_nms, validation_no_nms],
+                    feed_dict={
+                        _x: batch_xs,
+                        _y_gt: batch_ys
+                    },
+                    options=run_option,
+                )
             train_writer.add_summary(train_summary, idx)
 
         elapsed_time = datetime.datetime.now() - start_time
@@ -976,49 +1138,51 @@ def train_dot_count():
                 return -1
             saver.save(sess, ckpt_name, global_step=global_step)
 
-            jdx = 0
-            image_size = 320
-            mae = 0
-            while True:
-                batch_xs, batch_ys, _ = eval_reader.next_batch(
-                                          FLAGS.batch_size,
-                                          image_size=image_size,
-                                          only_person_num=True,
-                                          infinite=False
-                                        )
-                if not len(batch_xs): break
-                sys.stdout.write("Testing batch[{}]...".format(jdx))
-                jdx += 1
-                sys.stdout.flush()
-                start_time = datetime.datetime.now()
-                output_counts = sess.run(counts,
-                                         feed_dict={_x: batch_xs},
-                                         options=run_option)
-                elapsed_time = datetime.datetime.now() - start_time
-                error = cal_mae(output_counts, batch_ys)
-                mae += error
-                sys.stdout.write(
-                  "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
-                )
-            print("\nFinal MAE: {}\n".format(mae/float(jdx)))
-            # re-initiating the reader such that it loop from the beginning
-            eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+            #jdx = 0
+            #image_size = 320
+            #mae = 0
+            #while True:
+            #    batch_xs, batch_ys, _ = eval_reader.next_batch_dotcount(
+            #                              FLAGS.batch_size,
+            #                              image_size=image_size,
+            #                              only_person_num=True,
+            #                              infinite=False
+            #                            )
+            #    if not len(batch_xs): break
+            #    sys.stdout.write("Testing batch[{}]...".format(jdx))
+            #    jdx += 1
+            #    sys.stdout.flush()
+            #    start_time = datetime.datetime.now()
+            #    output_counts = sess.run(counts,
+            #                             feed_dict={_x: batch_xs},
+            #                             options=run_option)
+            #    elapsed_time = datetime.datetime.now() - start_time
+            #    error = cal_mae(output_counts, batch_ys)
+            #    mae += error
+            #    sys.stdout.write(
+            #      "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
+            #    )
+            #print("\nFinal MAE: {}\n".format(mae/float(jdx)))
+            ## re-initiating the reader such that it loop from the beginning
+            #eval_reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
 
 
         idx += 1
     print("End of training.")
 
 def count_persons(output, infer_threshold):
-    """Count the number of predictions whose confidence is higher than @infer_threshold.
+    """Count the number of predictions whose confidence is higher than
+    @infer_threshold.
 
       Args:
           output: Output of the neural network. In shape
-            [batch_size, image_size/32, image_size/32, num_of_anchor_boxes]
+            [batch_size, image_size/32, image_size/32, num_anchor_boxes]
           infer_threshold: See FLAGS.infer_threshold.
       Return:
           result: Number of persons in each image. In shape
             [batch_size, 1]
     """
+    #TODO use tf.sigmoid() !!!
     shape = tf.shape(output)
     output = tf.reshape(output, [shape[0], -1])
     output = tf.cast(tf.greater(output, infer_threshold), tf.int32)
@@ -1048,75 +1212,75 @@ def cal_mae(output_counts, ground_truth_counts):
                                                     ))
     return result
 
-def eval_dotcount_model():
-    """Evaluate the dotcount model using MAE (mean absolute error)."""
-
-    tf.logging.info("Building tensorflow graph...")
-
-    _x = tf.placeholder(tf.float32, [None, None, None, 3])
-    _y, vars_to_restore = YOLOvx(
-                            _x,
-                            backbone_arch=FLAGS.backbone_arch,
-                            num_of_anchor_boxes=FLAGS.num_of_anchor_boxes,
-                            freeze_backbone=True,
-                            only_confidence=True,
-                            reuse=tf.AUTO_REUSE
-                          )
-    counts = count_persons(_y, FLAGS.infer_threshold)
-
-    _y_gt = tf.placeholder(tf.int32, [None, 1])
-
-    global_step = tf.Variable(0, name='self_global_step',
-                              trainable=False, dtype=tf.int32)
-
-    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
-    all_vars.extend(vars_to_restore)
-    all_vars = list(set(all_vars))
-    all_vars.append(global_step)
-
-    tf.logging.info("All network loss/train_step built! Yah!")
-
-    # load images and labels
-    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
-
-    initializer = tf.global_variables_initializer()
-
-    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
-    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
-                                            log_device_placement=False))
-
-    sess.run(initializer)
-
-    restorer = tf.train.Saver(all_vars)
-    restorer = restorer.restore(sess, FLAGS.checkpoint)
-    tf.logging.info("checkpoint restored!")
-
-    idx = 0
-    image_size = 320
-    mae = 0
-    while True:
-        batch_xs, batch_ys, _ = reader.next_batch(
-                                  FLAGS.batch_size,
-                                  image_size=image_size,
-                                  only_person_num=True,
-                                  infinite=False
-                                )
-        if not len(batch_xs): break
-        sys.stdout.write("Testing batch[{}]...".format(idx))
-        idx += 1
-        sys.stdout.flush()
-        start_time = datetime.datetime.now()
-        output_counts = sess.run(counts,
-                                 feed_dict={_x: batch_xs},
-                                 options=run_option)
-        elapsed_time = datetime.datetime.now() - start_time
-        error = cal_mae(output_counts, batch_ys)
-        mae += error
-        sys.stdout.write(
-          "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
-        )
-
-    print("\nFinal MAE: {}\n".format(mae/float(idx)))
+#def eval_dotcount_model():
+#    """Evaluate the dotcount model using MAE (mean absolute error)."""
+#
+#    tf.logging.info("Building tensorflow graph...")
+#
+#    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+#    _y, vars_to_restore = YOLOvx(
+#                            _x,
+#                            backbone_arch=FLAGS.backbone_arch,
+#                            num_anchor_boxes=FLAGS.num_anchor_boxes,
+#                            freeze_backbone=True,
+#                            only_confidence=True,
+#                            reuse=tf.AUTO_REUSE
+#                          )
+#    counts = count_persons(_y, FLAGS.infer_threshold)
+#
+#    _y_gt = tf.placeholder(tf.int32, [None, 1])
+#
+#    global_step = tf.Variable(0, name='self_global_step',
+#                              trainable=False, dtype=tf.int32)
+#
+#    all_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+#    all_vars.extend(vars_to_restore)
+#    all_vars = list(set(all_vars))
+#    all_vars.append(global_step)
+#
+#    tf.logging.info("All network loss/train_step built! Yah!")
+#
+#    # load images and labels
+#    reader = DatasetReader(FLAGS.eval_files_list, FLAGS.class_name_file)
+#
+#    initializer = tf.global_variables_initializer()
+#
+#    run_option = tf.RunOptions(report_tensor_allocations_upon_oom=True)
+#    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=False,
+#                                            log_device_placement=False))
+#
+#    sess.run(initializer)
+#
+#    restorer = tf.train.Saver(all_vars)
+#    restorer = restorer.restore(sess, FLAGS.checkpoint)
+#    tf.logging.info("checkpoint restored!")
+#
+#    idx = 0
+#    image_size = 320
+#    mae = 0
+#    while True:
+#        batch_xs, batch_ys, _ = reader.next_batch_dotcount(
+#                                  FLAGS.batch_size,
+#                                  image_size=image_size,
+#                                  only_person_num=True,
+#                                  infinite=False
+#                                )
+#        if not len(batch_xs): break
+#        sys.stdout.write("Testing batch[{}]...".format(idx))
+#        idx += 1
+#        sys.stdout.flush()
+#        start_time = datetime.datetime.now()
+#        output_counts = sess.run(counts,
+#                                 feed_dict={_x: batch_xs},
+#                                 options=run_option)
+#        elapsed_time = datetime.datetime.now() - start_time
+#        error = cal_mae(output_counts, batch_ys)
+#        mae += error
+#        sys.stdout.write(
+#          "Prediction time: {} | Current mae: {}\n".format(elapsed_time, error)
+#        )
+#
+#    print("\nFinal MAE: {}\n".format(mae/float(idx)))
 
 def main(_):
 

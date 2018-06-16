@@ -313,7 +313,7 @@ def inception_v1(inputs,
       with tf.variable_scope('Logits'):
         #if global_pool:
         #  # Global average pooling.
-        #  net = tf.reduce_mean(net, [1, 2], keep_dims=True, name='global_pool')
+        #  net = tf.reduce_mean(net, [1, 2], keepdims=True, name='global_pool')
         #  end_points['global_pool'] = net
         #else:
         #  # Pooling with a fixed kernel size.

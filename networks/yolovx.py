@@ -80,7 +80,7 @@ def shortcut_from_input(images):
 
 # image should be of shape [None, x, x, 3], where x should multiple of 32,
 # starting from 320 to 608.
-def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
+def YOLOvx(images, backbone_arch, num_anchor_boxes, num_classes=None,
            freeze_backbone=True, only_confidence=False, reuse=tf.AUTO_REUSE):
     """ This architecture of YOLO is not strictly the same as in those papers.
     We use some backbone networks as a starting point, and then add necessary
@@ -89,8 +89,8 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
     Args:
         images: Input images, of shape [None, None, None, 3].
         backbone_arch: backbone network to use.
-        num_of_anchor_boxes: See FLAGS.num_of_anchor_boxes.
-        num_of_classes: see FLAGS.num_of_classes.
+        num_anchor_boxes: See FLAGS.num_anchor_boxes.
+        num_classes: see FLAGS.num_classes.
         reuse: Whether or not the network weights should be reused when
             building another YOLOvx in the same program.
         only_confidence: include only confidence in the output (i.e., output
@@ -125,16 +125,20 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
         # backbone = tf.concat([backbone, shortcut], axis=-1, name="backbone_with_shortcut")
 
         if only_confidence:
-            net = slim.conv2d(
+            backbone = slim.conv2d(
                     backbone,
-                    num_of_anchor_boxes,
+                    num_anchor_boxes * 2,
                     [3, 3],
-                    scope="bboxes_only_confidence"
-                  )
+                    scope='bboxes_with_confidences')
+            #global max pooling
+            #[batch_size, 1, 1, num_anchor_boxes*2]
+            net = tf.reduce_max(backbone, [1,2], name='g_a_p', keepdims=True)
+            #[batch_size, num_anchor_boxes*2]
+            net = tf.squeeze(net)
         else:
             net = slim.conv2d(
                     backbone,
-                    num_of_anchor_boxes * (5 + num_of_classes),
+                    num_anchor_boxes * (5 + num_classes),
                     [3, 3],
                     scope="bboxes_full"
                 )
@@ -143,8 +147,8 @@ def YOLOvx(images, backbone_arch, num_of_anchor_boxes, num_of_classes=None,
 class YOLOLoss():
     """ Provides methods for calculating loss """
 
-    def __init__(self, batch_size, num_of_anchor_boxes, num_of_classes,
-                 num_of_gt_bnx_per_cell, global_step):
+    def __init__(self, batch_size, num_anchor_boxes, num_classes,
+                 num_gt_bnx_per_cell, global_step):
         """
           Args:
             (see their difinition in FLAGS)
@@ -154,9 +158,9 @@ class YOLOLoss():
         # but we are not using it anywhere when building then network/loss,
         # because, maybe we will have a variable-sized batch input, who know?
         self.__batch_size = batch_size
-        self.num_of_anchor_boxes = num_of_anchor_boxes
-        self.num_of_classes = num_of_classes
-        self.num_of_gt_bnx_per_cell = num_of_gt_bnx_per_cell
+        self.num_anchor_boxes = num_anchor_boxes
+        self.num_classes = num_classes
+        self.num_gt_bnx_per_cell = num_gt_bnx_per_cell
         self.global_step = global_step
 
     @staticmethod
@@ -294,22 +298,22 @@ class YOLOLoss():
                 [batch_size,
                     image_size/32,
                         image_size/32,
-                            num_of_anchor_boxes * (5 + num_of_classes)]
+                            num_anchor_boxes * (5 + num_classes)]
             ground_truth: Ground truth bounding boxes. In shape
                 [batch_size,
                     image_size/32,
                         image_size/32,
-                            num_of_gt_bnx_per_cell * 5]
+                            num_gt_bnx_per_cell * 5]
           Return:
               loss: The final loss (after tf.reduce_mean()).
         """
 
-        num_of_anchor_boxes = self.num_of_anchor_boxes
-        num_of_classes = self.num_of_classes
-        num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
+        num_anchor_boxes = self.num_anchor_boxes
+        num_classes = self.num_classes
+        num_gt_bnx_per_cell = self.num_gt_bnx_per_cell
 
         # concat ground_truth and output to make a tensor of shape 
-        #   (?, ?, ?, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell)
+        #   (?, ?, ?, num_anchor_boxes*(5+num_classes) + 5*num_gt_bnx_per_cell)
         output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
                                             name="output_and_ground_truth_concat")
 
@@ -317,41 +321,41 @@ class YOLOLoss():
         op_and_gt_batch = \
                 tf.reshape(
                     output_and_ground_truth,
-                    [-1, num_of_anchor_boxes*(5+num_of_classes) + 5*num_of_gt_bnx_per_cell]
+                    [-1, num_anchor_boxes*(5+num_classes) + 5*num_gt_bnx_per_cell]
                 )
 
-        split_num = num_of_anchor_boxes*(5+num_of_classes)
+        split_num = num_anchor_boxes*(5+num_classes)
         op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
-                              [-1, num_of_anchor_boxes, 5+num_of_classes])
+                              [-1, num_anchor_boxes, 5+num_classes])
         # op_boxes = tf.Print(op_boxes, [op_boxes], "!!!op_boxes: ", summarize=10000)
         gt_boxes = tf.reshape(op_and_gt_batch[..., split_num:],
-                              [-1, num_of_gt_bnx_per_cell, 5])
+                              [-1, num_gt_bnx_per_cell, 5])
         # There are many some fake ground truth (i.e., [0,0,0,0,0]) in gt_boxes, 
         # but we can't naively remove it here. Instead, we use tf.boolean_mask()
         # to mask the relevant tensors out.
 
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        # [-1, num_gt_bnx_per_cell, num_anchor_boxes]
         ious = YOLOLoss.bbox_iou_center_xy_batch(
                                 gt_boxes[:, :, 1:5],
                                 op_boxes[:, :, 0:4]
                             )
-        # [-1, num_of_gt_bnx_per_cell, 1]
+        # [-1, num_gt_bnx_per_cell, 1]
         values, idx = tf.nn.top_k(ious, k=1)
-        # [-1, num_of_gt_bnx_per_cell] (just squeeze the last dimension)
-        idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
+        # [-1, num_gt_bnx_per_cell] (just squeeze the last dimension)
+        idx = tf.reshape(idx, [-1, num_gt_bnx_per_cell])
 
         # Get tuples of (gt, op) with the max iou (i.e., those who match)
         #
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
-        one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+        # [-1, num_gt_bnx_per_cell, num_anchor_boxes]
+        one_hot_idx = tf.one_hot(idx, depth=num_anchor_boxes)
         full_idx = tf.where(tf.equal(1.0, one_hot_idx))
         gt_idx = full_idx[:, 0:2]
         op_idx = full_idx[:, 0:3:2]
         # [?, 5]
         gt_boxes_max = tf.gather_nd(gt_boxes, gt_idx)
-        # [?, 5+num_of_classes]
+        # [?, 5+num_classes]
         op_boxes_max = tf.gather_nd(op_boxes, op_idx)
-        # [?, 5+num_of_classes + 5]
+        # [?, 5+num_classes + 5]
         # NOTE the order in which they are concatenated!
         iou_max_boxes_raw = tf.concat([op_boxes_max, gt_boxes_max], axis=1)
         # mask out fake gt_op pair
@@ -366,7 +370,7 @@ class YOLOLoss():
         # Compute the real iou one by one
         iou_flat = YOLOLoss.bbox_iou_center_xy_flat(
                     iou_max_boxes[..., 0:4],
-                    iou_max_boxes[..., 5+num_of_classes+1 : 5+num_of_classes+5]
+                    iou_max_boxes[..., 5+num_classes+1 : 5+num_classes+5]
                    )
 
         # Get op boxes which are never matched by any non-fake gt boxes.
@@ -375,14 +379,14 @@ class YOLOLoss():
                            tf.float32
                        )[..., None]
         filtered_one_hot = one_hot_idx * nonzero_mask
-        # [-1, num_of_anchor_boxes]
+        # [-1, num_anchor_boxes]
         active_op = tf.sign(tf.reduce_sum(filtered_one_hot, axis=1))
         nonactive_op = 1 - active_op
         nonactive_op_idx = tf.where(tf.equal(1.0, nonactive_op))
         op_never_matched = tf.gather_nd(op_boxes, nonactive_op_idx)
 
         #coordinate loss
-        _5_nc = 5+num_of_classes
+        _5_nc = 5+num_classes
         cooridniates_se_wh = tf.square(
                         tf.sqrt(iou_max_boxes[:, 2:4])-tf.sqrt(iou_max_boxes[:, _5_nc+3:_5_nc+5])
                     )
@@ -439,16 +443,20 @@ class YOLOLoss():
 class DotcountLoss():
     """Provide methods for calculating loss for the dotcount model."""
 
-    def __init__(self, batch_size, num_of_anchor_boxes,
-                 num_of_gt_bnx_per_cell, global_step):
+    def __init__(self, batch_size, num_anchor_boxes,
+                 num_gt_bnx, global_step):
         """
           Args:
             (see their difinition in FLAGS)
             global_step: A tensor, used to switch between loss function
         """
-        self.__batch_size = batch_size
-        self.num_of_anchor_boxes = num_of_anchor_boxes
-        self.num_of_gt_bnx_per_cell = num_of_gt_bnx_per_cell
+        self.batch_size = batch_size
+        # This is not quite accurate, but I don't want it too complicated.
+        assert int(num_anchor_boxes**0.5)**2 == int(num_anchor_boxes), \
+                "num_anchor_boxes should be square of some integer!"
+        self.num_anchor_boxes = num_anchor_boxes
+        # number of ground_truth bounding box per image
+        self.num_gt_bnx = num_gt_bnx
         self.global_step = global_step
 
     @staticmethod
@@ -478,76 +486,136 @@ class DotcountLoss():
         distance = tf.sqrt(tf.square(xi1 - xi2) + tf.square(yi1 - yi2))
         return 1 / (distance+0.0001)
 
+    def get_indices(self):
+        """Get indices in north, south, west, east and output a tensor in
+        shape [batch_size*num_anchor_boxes, 1] for each direction.
+
+        Note that if there is no anchor in one direction, a index
+        [batch_size*num_anchor_boxes] will be returned because we assume that
+        the last location contains 0 (i.e., [-1] will be returned, but since
+        tf.gather_nd() does not allow -1 in indices, we have to return the
+        index explicitly.)
+        """
+        batch_size = self.batch_size
+        num_anchor_boxes = self.num_anchor_boxes
+        rows_num = int(num_anchor_boxes ** 0.5)
+        #north
+        idxs_n = []
+        idxs_nw = []
+        idxs_ne = []
+        idxs_s = []
+        idxs_sw = []
+        idxs_se = []
+        idxs_w = []
+        idxs_e = []
+        for i in range(batch_size):
+            for j in range(num_anchor_boxes):
+                #north
+                idx = j - rows_num
+                if idx < 0:
+                    idxs_n.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_n.append([i*num_anchor_boxes + idx])
+
+                #north-west
+                idx = j - rows_num - 1
+                if j % rows_num == 0 or idx < 0:
+                    idxs_nw.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_nw.append([i*num_anchor_boxes+idx])
+
+                #north-east
+                idx = j - rows_num + 1
+                if (j+1)  % rows_num == 0 or idx < 0:
+                    idxs_ne.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_ne.append([i*num_anchor_boxes+idx])
+
+                #south
+                idx = j + rows_num
+                if idx >= num_anchor_boxes:
+                    idxs_s.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_s.append([i*num_anchor_boxes + idx])
+
+                #south-west
+                idx = j + rows_num - 1
+                if j % rows_num == 0 or idx >= num_anchor_boxes:
+                    idxs_sw.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_sw.append([i*num_anchor_boxes+idx])
+
+                #south-east
+                idx = j + rows_num + 1
+                if (j+1) % rows_num == 0 or idx >= num_anchor_boxes:
+                    idxs_se.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_se.append([i*num_anchor_boxes+idx])
+                #west
+                idx = j - 1
+                if j % rows_num == 0:
+                    idxs_w.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_w.append([i*num_anchor_boxes + idx])
+
+                #east
+                idx = j+1
+                if (j+1) % rows_num == 0:
+                    idxs_e.append([batch_size*num_anchor_boxes])
+                else:
+                    idxs_e.append([i*num_anchor_boxes + idx])
+
+        return (tf.constant(idxs_n), tf.constant(idxs_s),
+                tf.constant(idxs_w), tf.constant(idxs_e),
+                tf.constant(idxs_nw), tf.constant(idxs_ne),
+                tf.constant(idxs_sw), tf.constant(idxs_se))
+
     def calculate_loss(self, output, ground_truth):
         """Calculate loss as described in the dotcount model.
 
           Args:
               output: Computed output from the network. In shape
-                [batch_size,
-                    image_size/32,
-                        image_size/32,
-                            num_of_anchor_boxes * 3]
+                [batch_size, num_anchor_boxes * 4]
+                where the 4 represents
+                    (x, y, confidence, confidence of nearby anchors)
               ground_truth: Ground truth bouding boxes. In shape
-                [batch_size,
-                    image_size/32,
-                        image_size/32,
-                            num_of_gt_bnx_per_cell * 5]
+                [batch_size, num_gt_bnx * 5]
+                where the 2 represents (label, x, y, w, h)
           Return:
               loss: The final loss.
         """
-        num_of_anchor_boxes = self.num_of_anchor_boxes
-        num_of_gt_bnx_per_cell = self.num_of_gt_bnx_per_cell
+        batch_size = self.batch_size
+        num_anchor_boxes = self.num_anchor_boxes
+        num_gt_bnx = self.num_gt_bnx
 
         # take only its x/y
-        gt_shape = tf.shape(ground_truth)
         ground_truth = tf.reshape(
                 ground_truth,
-                [gt_shape[0], gt_shape[1], gt_shape[2], num_of_gt_bnx_per_cell, 5]
+                [batch_size, num_gt_bnx, 5]
             )
-        ground_truth = ground_truth[..., 1:3]
-        # [-1, -1, -1, 2]
-        ground_truth = tf.reshape(
-                ground_truth,
-                [gt_shape[0], gt_shape[1], gt_shape[2], -1]
-            )
-
-        output_and_ground_truth = tf.concat([output, ground_truth], axis=3,
-                                            name="output_and_ground_truth_concat")
-        op_and_gt_batch = \
-                tf.reshape(
-                    output_and_ground_truth,
-                    [-1, num_of_anchor_boxes*3 + num_of_gt_bnx_per_cell*2]
-                )
-
-        split_num = num_of_anchor_boxes * 3
-        op_boxes = tf.reshape(op_and_gt_batch[..., 0:split_num],
-                              [-1, num_of_anchor_boxes, 3])
-        #op_boxes = tf.Print(
-        #        op_boxes,
-        #        [op_boxes[..., 2]],
-        #        "op_boxes objectness: ",
-        #        summarize=10000
-        #    )
-        gt_boxes = tf.reshape(op_and_gt_batch[..., split_num:],
-                              [-1, num_of_gt_bnx_per_cell, 2])
+        # [batch_size, num_gt_bnx, 2]
         # fake ground truth bboxes have 0.0 in their x/y.
+        gt_boxes = ground_truth[..., 1:3]
 
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
+        # [batch_size, num_anchor_boxes, 4]
+        op_boxes = tf.reshape(output, [batch_size, num_anchor_boxes, 4])
+
+        # [-1, num_gt_bnx, num_anchor_boxes]
         #
         # NOTE this function return 1/distance, so the pair who have the
         # smallest distance will have the largest result.
         distances = DotcountLoss.bbox_dist_center_xy_batch(gt_boxes,
                                                            op_boxes[..., 0:2])
-        # [-1, num_of_gt_bnx_per_cell, 1]
+        # [-1, num_gt_bnx, 1]
         values, idx = tf.nn.top_k(distances, k=1)
-        # [-1, num_of_gt_bnx_per_cell]
-        # We don't use tf.squeeze() here because `num_of_gt_bnx_per_cell' may be 1
-        idx = tf.reshape(idx, [-1, num_of_gt_bnx_per_cell])
+        # [-1, num_gt_bnx]
+        # We don't use tf.squeeze() here because `num_gt_bnx' may be 1
+        idx = tf.reshape(idx, [-1, num_gt_bnx])
 
-        # Get tuples of (gt, op) will the max distance (i.e., those who match)
+        # Get tuples of (gt, op) with the max distance (i.e., those who match)
         #
-        # [-1, num_of_gt_bnx_per_cell, num_of_anchor_boxes]
-        one_hot_idx = tf.one_hot(idx, depth=num_of_anchor_boxes)
+        # [-1, num_gt_bnx, num_anchor_boxes]
+        one_hot_idx = tf.one_hot(idx, depth=num_anchor_boxes)
         # [-1, 3]
         full_idx = tf.where(tf.equal(1.0, one_hot_idx))
         # [-1, 2]
@@ -572,19 +640,62 @@ class DotcountLoss():
         #                         )
 
         # Get op boxes which are never matched by any non-fake gt boxes
-        nonzero_mask = tf.cast(
+        nonzero_mask_2 = tf.cast(
                             tf.reduce_any(tf.not_equal(0.0, gt_boxes), axis=2),
                             tf.float32
                        )[..., None]
-        filtered_one_hot = one_hot_idx * nonzero_mask
-        # [-1, num_of_anchor_boxes]
+        filtered_one_hot = one_hot_idx * nonzero_mask_2
+        # [-1, num_anchor_boxes]
         active_op = tf.sign(tf.reduce_sum(filtered_one_hot, axis=1))
         nonactive_op = 1 - active_op
         nonactive_op_idx = tf.where(tf.equal(1.0, nonactive_op))
         op_never_matched = tf.gather_nd(op_boxes, nonactive_op_idx)
 
+        # Get the nearby-boxes-matched-or-not tensor of shape
+        #       [batch_size, num_anchor_boxes]
+        # First get the real distribution in shape
+        # [batch_size*num_anchor_boxes], and pad a 0 at the end such that it can
+        # be treated as a dedicated fake one.
+        active_op_idx = tf.cast(tf.boolean_mask(op_idx, nonzero_mask), tf.int32)
+        scatter_shape = tf.constant([batch_size, num_anchor_boxes])
+        scatter_update = tf.cast(
+                tf.reduce_any(tf.equal(1, tf.ones_like(active_op_idx)), axis=1),
+                tf.float32
+            )
+        scatter = tf.scatter_nd(active_op_idx, scatter_update, scatter_shape)
+        #[batch_size*num_anchor_boxes, ]
+        real = tf.reshape(scatter, [batch_size*num_anchor_boxes])
+        #[batch_size*num_anchor_boxes + 1, ]
+        real = tf.concat([real, tf.constant([0.0])], axis=-1)
+        # get nearby-box-matched-or-not in each direction
+        (idxs_n, idxs_s, idxs_w, idxs_e,
+         idxs_nw, idxs_ne, idxs_sw, idxs_se) = self.get_indices()
+        #[batch_size*num_anchor_boxes, 1]
+        north = tf.expand_dims(tf.gather_nd(real, idxs_n), axis=-1)
+        south = tf.expand_dims(tf.gather_nd(real, idxs_s), axis=-1)
+        west = tf.expand_dims(tf.gather_nd(real, idxs_w), axis=-1)
+        east = tf.expand_dims(tf.gather_nd(real, idxs_e), axis=-1)
+        north_west = tf.expand_dims(tf.gather_nd(real, idxs_nw), axis=-1)
+        north_east = tf.expand_dims(tf.gather_nd(real, idxs_ne), axis=-1)
+        south_west = tf.expand_dims(tf.gather_nd(real, idxs_sw), axis=-1)
+        south_east = tf.expand_dims(tf.gather_nd(real, idxs_se), axis=-1)
+        # [batch_size*num_anchor_boxes, 8]
+        conc = tf.concat([north, south, west, east,
+                          north_west, north_east, south_west, south_east],
+                          axis=-1)
+        # [batch_size*num_anchor_boxes, ]
+        nearby = tf.cast(
+                tf.reduce_any(tf.equal(1.0, conc), axis=1),
+                tf.float32
+            )
+        # output nearby-box-confidence
+        #[batch_size, num_anchor_boxes]
+        output_nearby = op_boxes[..., 3]
+        output_nearby = tf.reshape(output_nearby, [-1])
+
         # calculate loss
         objectness_loss = tf.reduce_sum(tf.square(dist_max_boxes[..., 2]-1))
+        objectness_loss = tf.log(objectness_loss+1)
         #objectness_loss = tf.Print(
         #        objectness_loss,
         #        [dist_max_boxes[..., 2]],
@@ -592,24 +703,33 @@ class DotcountLoss():
         #        summarize=10000
         #    )
         nonobjectness_loss = tf.reduce_sum(tf.square(op_never_matched[..., 2]-0))
-        nonobjectness_loss = tf.log(nonobjectness_loss)
+        nonobjectness_loss = tf.log(nonobjectness_loss+1)
         #nonobjectness_loss = tf.Print(
         #        nonobjectness_loss,
         #        [op_never_matched[..., 2]],
         #        "op_never_matched nonobjectness: ",
         #        summarize=10000
         #    )
+        nearby_loss = tf.reduce_sum(tf.square(output_nearby-nearby))
+        nearby_loss = tf.log(nearby_loss+1)
+        #nearby_loss = tf.Print(
+        #        nearby_loss,
+        #        [output_nearby],
+        #        "output_nearby: ",
+        #        summarize=10000
+        #    )
 
-        loss = objectness_loss + nonobjectness_loss
+        loss = objectness_loss + nonobjectness_loss + nearby_loss
         #loss = tf.Print(
         #        loss,
-        #        [objectness_loss, nonobjectness_loss],
-        #        "ol & nol: ",
+        #        [objectness_loss, nonobjectness_loss, nearby_loss],
+        #        "ol & nol & nlo: ",
         #        summarize=10000
         #    )
 
         tf.summary.scalar("objectness_loss", objectness_loss)
         tf.summary.scalar("nonobjectness_loss", nonobjectness_loss)
+        tf.summary.scalar("nearby_loss", nearby_loss)
         tf.summary.scalar("loss", loss)
         return loss
 

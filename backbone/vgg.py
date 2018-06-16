@@ -125,7 +125,7 @@ def vgg_a(inputs,
       # Convert end_points_collection into a end_point dict.
       end_points = slim.utils.convert_collection_to_dict(end_points_collection)
       if global_pool:
-        net = tf.reduce_mean(net, [1, 2], keep_dims=True, name='global_pool')
+        net = tf.reduce_mean(net, [1, 2], keepdims=True, name='global_pool')
         end_points['global_pool'] = net
       if num_classes:
         net = slim.dropout(net, dropout_keep_prob, is_training=is_training,
@@ -204,7 +204,7 @@ def vgg_16(inputs,
       # Convert end_points_collection into a end_point dict.
       end_points = slim.utils.convert_collection_to_dict(end_points_collection)
       if global_pool:
-        net = tf.reduce_mean(net, [1, 2], keep_dims=True, name='global_pool')
+        net = tf.reduce_mean(net, [1, 2], keepdims=True, name='global_pool')
         end_points['global_pool'] = net
       if num_classes:
         net = slim.dropout(net, dropout_keep_prob, is_training=is_training,
@@ -283,7 +283,7 @@ def vgg_19(inputs,
       # Convert end_points_collection into a end_point dict.
       end_points = slim.utils.convert_collection_to_dict(end_points_collection)
       if global_pool:
-        net = tf.reduce_mean(net, [1, 2], keep_dims=True, name='global_pool')
+        net = tf.reduce_mean(net, [1, 2], keepdims=True, name='global_pool')
         end_points['global_pool'] = net
       if num_classes:
         net = slim.dropout(net, dropout_keep_prob, is_training=is_training,
