@@ -13,6 +13,7 @@ import math
 import pdb
 import tensorflow as tf
 from backbone.inception_v1 import inception_v1
+from backbone.inception_v2 import inception_v2
 from backbone.inception_utils import inception_arg_scope
 from backbone.vgg import vgg_16
 from backbone.vgg import vgg_arg_scope
@@ -67,6 +68,22 @@ def backbone_network(images, backbone_arch, reuse):
                                             is_training=not freeze_backbone,
                                             global_pool=False,
                                             spatial_squeeze=False,
+                                            reuse=reuse)
+        vars_to_restore = slim.get_variables_to_restore()
+    #NOTE!! we are using tf.nn.relu instead of tf.nn.leaky_relu inside
+    #inception_v2, so most of the time you should freeze the backbone.
+    #For other architectures above, we have changed their internal
+    #activation functions from tf.nn.relu to tf.nn.leaky_relu, so most
+    #of the time you should not freeze the backbone when training. If
+    #you want to freeze the backbone when training, please change all
+    #tf.nn.leaky_relu back to tf.nn.relu so that the architectures come
+    #back to their original states after loading weights.
+    elif backbone_arch == 'inception_v2':
+        with slim.arg_scope(inception_arg_scope()):
+            backbone_network, endpoints = inception_v2(
+                                            images,
+                                            num_classes=None,
+                                            is_training=not freeze_backbone,
                                             reuse=reuse)
         vars_to_restore = slim.get_variables_to_restore()
     else:
@@ -139,6 +156,7 @@ def YOLOvx(images, backbone_arch, num_anchor_boxes, num_classes=1,
                 [3, 3],
                 scope="bboxes_full"
             )
+
     return net, vars_to_restore
 
 class YOLOLoss():
@@ -357,14 +375,27 @@ class YOLOLoss():
         # mask out fake gt_op pair
         nonzero_mask = tf.reduce_any(tf.not_equal(0.0, gt_boxes_max), axis=1)
         iou_max_boxes = tf.boolean_mask(iou_max_boxes_raw, nonzero_mask)
-        iou_max_op = iou_max_boxes[..., 0:5+num_classes]
-        iou_max_gt = iou_max_boxes[..., 5+num_classes: ]
         #iou_max_boxes = tf.Print(
         #        iou_max_boxes,
         #        [iou_max_boxes],
         #        "###iou_max_boxes: ",
         #        summarize=1000
         #    )
+        iou_max_op = iou_max_boxes[..., 0:5+num_classes]
+        iou_max_gt = iou_max_boxes[..., 5+num_classes: ]
+        #iou_max_op = tf.Print(
+        #                iou_max_op,
+        #                [iou_max_op],
+        #                "####iou_max_op: ",
+        #                summarize=1000
+        #             )
+        #iou_max_gt = tf.Print(
+        #                iou_max_gt,
+        #                [iou_max_gt],
+        #                "!!!!iou_max_gt: ",
+        #                summarize=1000
+        #             )
+
 
         # Compute the real iou one by one
         iou_flat = YOLOLoss.bbox_iou_center_xy_flat(
@@ -398,7 +429,9 @@ class YOLOLoss():
         #        "Shape info: "
         #    )
         cooridniates_se = tf.concat([cooridniates_se_xy, cooridniates_se_wh], axis=-1)
-        cooridniates_loss = tf.reduce_sum(cooridniates_se)
+        cooridniates_loss_pre = tf.reduce_sum(cooridniates_se)
+        # cooridniates_loss = 1 * tf.log(cooridniates_loss_pre + 1)
+        cooridniates_loss = 0.5 * cooridniates_loss_pre
 
         # objectness loss
         # We minus the output confidence by 1 instead of the real iou, which is
@@ -412,7 +445,9 @@ class YOLOLoss():
         #        "######objectness output: ",
         #        summarize=10000
         #    )
-        objectness_loss = tf.reduce_sum(objectness_se)
+        objectness_loss_pre = tf.reduce_sum(objectness_se)
+        # objectness_loss = 1 * tf.log(tf.reduce_sum(objectness_se) + 1)
+        objectness_loss = 1 * objectness_loss_pre
 
         #classness loss (TODO)
 
@@ -424,20 +459,27 @@ class YOLOLoss():
         #        "!!!!!!nonobjectness_se output: ",
         #        summarize=10000
         #    )
-        nonobjectness_loss = tf.reduce_sum(nonobjectness_se)
+        nonobjectness_loss_pre = tf.reduce_sum(nonobjectness_se)
         # nonobjectness_loss is too large and will overwhelm the whole network,
         # so we take its ln. Even that, most "nonobject boxes" have a objectness
         # lower than 0.5, so we think it is OK that we kind of "ignore" it.
-        nonobjectness_loss = tf.log(nonobjectness_loss)
-        #objectness_loss = tf.Print(
-        #        objectness_loss,
-        #        [cooridniates_loss, objectness_loss, nonobjectness_loss],
-        #        "cl & ol & nol: "
-        #    )
+        # nonobjectness_loss = 1 * tf.log(nonobjectness_loss_pre + 1)
+        nonobjectness_loss = 0.1 * nonobjectness_loss_pre
+        objectness_loss = tf.Print(
+                objectness_loss,
+                [cooridniates_loss_pre, objectness_loss_pre, nonobjectness_loss_pre],
+                "cl & ol & nol (pre): "
+            )
+        objectness_loss = tf.Print(
+                objectness_loss,
+                [cooridniates_loss, objectness_loss, nonobjectness_loss],
+                "cl & ol & nol: "
+            )
 
         tf.summary.scalar("cooridniates_loss", cooridniates_loss)
         tf.summary.scalar("objectness_loss", objectness_loss)
         tf.summary.scalar("nonobjectness_loss", nonobjectness_loss)
-        loss = 0.5*cooridniates_loss + 1*objectness_loss + 1*nonobjectness_loss
+        loss = cooridniates_loss + objectness_loss + nonobjectness_loss
+        tf.summary.scalar("loss", loss)
         return loss
 

@@ -8,8 +8,10 @@ import sys
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.ops import control_flow_ops
+from anchors import anchors_def
 from utils.dataset import DatasetReader
 from utils.dataset import ImageHandler
+from utils.freeze_graph import freeze_graph
 from utils.visualization_utils import draw_bounding_box_on_image_array
 from networks.yolovx import YOLOvx
 from networks.yolovx import YOLOLoss
@@ -17,15 +19,16 @@ from networks.yolovx import YOLOLoss
 slim = tf.contrib.slim
 trunc_normal = lambda stddev: tf.truncated_normal_initializer(0.0, stddev)
 
+#NOTE!!! tf.app.flags will not warn you for non-existed argument!
 tf.app.flags.DEFINE_boolean("train", False, "To train or not.")
 tf.app.flags.DEFINE_boolean("test", False, "To test/predict or not.")
 tf.app.flags.DEFINE_boolean("evaluate", False, "To evaluate or not.")
 tf.app.flags.DEFINE_boolean("multiple_images", False,
         "Predict for multiple images.")
 
-tf.app.flags.DEFINE_string("infile", "Image.jpg", "The image to predict.")
+tf.app.flags.DEFINE_string("infile", "./examples/image.jpg", "The image to predict.")
 tf.app.flags.DEFINE_alias("test_files_list", "infile")
-tf.app.flags.DEFINE_string("outfile", "Prediction.jpg",
+tf.app.flags.DEFINE_string("outfile", "./predictions/prediction.jpg",
         "Output path of the predictions.")
 tf.app.flags.DEFINE_alias("outdir", "outfile")
 # NOTE
@@ -52,7 +55,7 @@ tf.app.flags.DEFINE_boolean("restore_all_variables", False,
         "means restore only variables for the backbone network")
 tf.app.flags.DEFINE_string("backbone_arch", "inception_v1",
         "The backbone network architecture to use. "
-        "Available backbones are 'inception_v1', 'vgg_16', 'resnet_v2' .")
+        "Available backbones are  'inception_v1', 'vgg_16', 'resnet_v2', 'inception_v2'. ")
 tf.app.flags.DEFINE_alias("backbone", "backbone_arch")
 
 tf.app.flags.DEFINE_string("train_ckpt_dir", "/disk1/yolockpts/",
@@ -109,12 +112,14 @@ tf.app.flags.DEFINE_alias("num_gt_bnx", "num_gt_bnx_per_cell")
 tf.app.flags.DEFINE_integer("num_steps", 20000,
         "Max num of step. -1 makes it infinite.")
 
+tf.app.flags.DEFINE_boolean("only_export_tflite", False,
+        "Only export the tflite model")
+
 FLAGS = tf.app.flags.FLAGS
 
 tf.logging.set_verbosity(tf.logging.DEBUG)
 
-def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
-                 only_xy=False):
+def scale_output(output, outscale, num_anchor_boxes, num_classes=1):
     """ Scale x/y coordinates to be relative to the whole image.
 
         Args:
@@ -128,13 +133,10 @@ def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
             whole batch).
           num_anchor_boxes: See FLAGS.num_anchor_boxes.
           num_classes: See FLAGS.num_classes.
-          only_xy: Whether @output only include x/y coordinates.
 
         Return:
           output: the scaled output.
     """
-    xy_pad_num = 1 if only_xy else 3+num_classes
-
     # [None, None, 2]
     outscale_add_part = outscale[..., 0:2]
     # [None, None, 1]
@@ -143,7 +145,7 @@ def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
 
     outscale_add_shape = tf.shape(outscale_add_part)
     outscale_add_pad = tf.zeros(
-               [outscale_add_shape[0], outscale_add_shape[1], xy_pad_num],
+               [outscale_add_shape[0], outscale_add_shape[1], 3+num_classes],
                dtype=tf.float32
             )
     # [None, None, 5+num_classes]
@@ -155,7 +157,7 @@ def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
 
     outscale_div_shape = tf.shape(outscale_div_part)
     outscale_div_pad = tf.ones(
-               [outscale_div_shape[0], outscale_div_shape[1], xy_pad_num],
+               [outscale_div_shape[0], outscale_div_shape[1], 3+num_classes],
                dtype=tf.float32
             )
     outscale_div = tf.concat([outscale_div_part, outscale_div_pad], axis=-1)
@@ -166,7 +168,7 @@ def scale_output(output, outscale, num_anchor_boxes, num_classes=None,
     output = tf.reshape(
                 output,
                 [output_shape[0], output_shape[1], output_shape[2],
-                 num_anchor_boxes, 2+xy_pad_num])
+                 num_anchor_boxes, 5+num_classes])
 
     output = output / outscale_div + outscale_add
 
@@ -369,6 +371,34 @@ def validation(output, images, num_anchor_boxes, num_classes=1,
 def build_images_with_bboxes(*args, **kwargs):
     return validation(*args, **kwargs)
 
+def get_num_bnx_from_output(output, num_anchor_boxes, num_classes=1,
+                            infer_threshold=0.65, name="output_num_array"):
+    """Get number of output bounding box.
+
+      Args:
+          output: Output from the neural network.
+          infer_threshold: See FLAGS.infer_threshold.
+          name: name of the output tensor.
+      Return:
+          num_array: A number in an array, such as [5]. We return an array
+            instead of a number because toco has only --output_arrays argument.
+    """
+    output_shape = tf.shape(output)
+    output_row_num = output_shape[1]
+
+    output = tf.reshape(
+                output,
+                [-1, num_anchor_boxes*(output_row_num**2), 5+num_classes]
+            )
+
+    # mask all bounding boxes whose objectness values are less than
+    # threshold.
+    output_idx = output[..., 4]
+    mask = tf.cast(tf.greater(output_idx, infer_threshold), tf.int32)
+    num = tf.reduce_sum(mask)
+    num_array = tf.stack([num], name=name)
+    return num_array
+
 def build_images_with_ground_truth(ground_truth, images, num_gt_bnx,
         class_names=['person']):
     """Put ground truth boxes on images.
@@ -476,8 +506,10 @@ def train():
                             freeze_backbone=FLAGS.freeze_backbone,
                             reuse=tf.AUTO_REUSE
                           )
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAGS.num_anchor_boxes in anchors_def:
+        print("anchors not defined for anchor number {}".format(FLAGS.num_anchor_boxes))
+        exit()
+    anchors = anchors_def[FLAGS.num_anchor_boxes]
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     _y_gt = tf.placeholder(
@@ -659,15 +691,17 @@ def test():
 
     tf.logging.info("Building tensorflow graph...")
 
-    _x = tf.placeholder(tf.float32, [None, None, None, 3])
+    _x = tf.placeholder(tf.float32, [None, None, None, 3], name="input_images")
     _y, vars_to_restore = YOLOvx(
                             _x,
                             backbone_arch=FLAGS.backbone_arch,
                             num_anchor_boxes=FLAGS.num_anchor_boxes,
                             num_classes=FLAGS.num_classes
                           )
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAGS.num_anchor_boxes in anchors_def:
+        print("anchors not defined for anchor number {}".format(FLAGS.num_anchor_boxes))
+        exit()
+    anchors = anchors_def[FLAGS.num_anchor_boxes]
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
 
     output_scale_placeholder = tf.placeholder(tf.float32, [None, None, 3])
@@ -706,6 +740,74 @@ def test():
                                             log_device_placement=False))
     sess.run(initializer)
 
+    output_num_array = get_num_bnx_from_output(
+                           output=y_scaled,
+                           num_anchor_boxes=FLAGS.num_anchor_boxes,
+                           num_classes=FLAGS.num_classes,
+                           infer_threshold=FLAGS.infer_threshold,
+                           name="output_num_array"
+                       )
+    if FLAGS.only_export_tflite:
+        print("Outputing tflite ...")
+
+        # meta graph containing network structure (proto)
+        print("Writing graph_def proto to /tmp/mymodels/model.pbtxt ...")
+        tf.train.write_graph(sess.graph_def, "/tmp/mymodels", "model.pbtxt")
+
+        # frozen graph containing network structure and weights
+        print("Writing frozen graph to /tmp/mymodels/model_frozen.pb ...")
+        input_graph_proto_path = "/tmp/mymodels/model.pbtxt"
+        input_checkpoint_path = FLAGS.checkpoint
+        output_graph_path = "/tmp/mymodels/model_frozen.pb"
+        output_node_name = "output_num_array"
+        freeze_graph(
+                input_graph=input_graph_proto_path,
+                output_graph=output_graph_path,
+                input_checkpoint=input_checkpoint_path,
+                input_saver="",
+                checkpoint_version=2,
+                input_binary=False,
+                output_node_names=output_node_name,
+                restore_op_name="",
+                filename_tensor_name="save/Const:0", #deprecated
+                clear_devices=True,
+                initializer_nodes="",
+                variable_names_whitelist="",
+                variable_names_blacklist="",
+                input_meta_graph="",
+                input_saved_model_dir="",
+                saved_model_tags="serve"
+            )
+
+        # TODO these method are only available in Tensorflow1.9. Use the cmd
+        # `toco` instead:
+        #
+        #       IMAGE_SIZE=320
+        #       toco \
+        #         --input_file=/tmp/mymodels/model_frozen.pb \
+        #         --output_file=/tmp/mymodels/converted_model.lite \
+        #         --input_format=TENSORFLOW_GRAPHDEF \
+        #         --output_format=TFLITE \
+        #         --input_shape=1,${IMAGE_SIZE},${IMAGE_SIZE},3 \
+        #         --input_array=input_images \
+        #         --output_array=output_num_array \
+        #         --inference_type=FLOAT \
+        #         --input_data_type=FLOAT
+        #
+        #convert to tflite
+        #input_arrays = ["input_images"]
+        #output_arrays = ["output_num_array"]
+        #converter = tf.contrib.lite.TocoConverter.from_frozen_graph(
+        #                                            output_graph_path,
+        #                                            input_arrays,
+        #                                            output_arrays
+        #                                          )
+        #tflite_model = converter.convert()
+        #tflite_output_path = "/tmp/mymodels/converted_model.tflite"
+        #print("Writing converted tflite model to {}".format(tflite_output_path))
+        #open(tflite_output_path, "wb").write(tflite_model)
+        #return
+
     restorer = tf.train.Saver(all_vars)
     restorer = restorer.restore(sess, FLAGS.checkpoint)
     tf.logging.info("checkpoint restored!")
@@ -715,8 +817,9 @@ def test():
     with tf.contrib.tfprof.ProfileContext('/tmp/profile_dir',
                                           trace_steps=[0],
                                           dump_steps=[0]) as pctx:
-        opts = tf.profiler.ProfileOptionBuilder.float_operation()
-        pctx.add_auto_profiling('op', opts, [0])
+        #uncomment these to see flops benchmarks
+        # opts = tf.profiler.ProfileOptionBuilder.float_operation()
+        # pctx.add_auto_profiling('op', opts, [0])
 
         while True:
             (batch_xs, batch_xs_scale_info,
@@ -763,8 +866,10 @@ def eval():
                             num_anchor_boxes=FLAGS.num_anchor_boxes,
                             num_classes=FLAGS.num_classes
                           )
-    # TODO should not be hard-coded.
-    anchors = [(0.25, 0.75), (0.75, 0.75), (0.5, 0.5), (0.25, 0.25), (0.75, 0.25)]
+    if not FLAGS.num_anchor_boxes in anchors_def:
+        print("anchors not defined for anchor number {}".format(FLAGS.num_anchor_boxes))
+        exit()
+    anchors = anchors_def[FLAGS.num_anchor_boxes]
     _y = fit_anchor_boxes(_y, FLAGS.num_anchor_boxes, anchors)
     _y_gt = tf.placeholder(
                 tf.float32,
