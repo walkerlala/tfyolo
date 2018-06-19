@@ -1,16 +1,16 @@
 This README will guide you through:
 
-    0. What we are doing and what we have achieved.
+ 1. What we are doing and what we have achieved.
 
-    1. The organization of this project, including source files structure and
-       source code structure.
+ 2. The organization of this project, including source files structure and
+    source code structure.
 
-    2. How to train/test, how to make improvement based on this project.
+ 3. How to train/test, how to make improvement based on this project.
 
-    3. How to convert a tensorflow model that can run successfully on a PC to a
-       tflite model that can run on android.
+ 4. How to convert a tensorflow model that can run successfully on a PC to a
+    tflite model that can run on android.
 
-### what we are doing and what we have achieved
+### I what we are doing and what we have achieved
 
 Basically we are doing Object Detection here. We build a  deep neural network
 similar to that of YOLO and try to simplified the network structure so that it
@@ -19,7 +19,7 @@ implementation) yet (sigh!). We have successfully trained several models which
 can perform well on training dataset but fail to generalize on testing dataset
 (i.e., overfitting).
 
-### Source code/file organization
+### II Source code/file organization
 
 #### Source files organzation
 
@@ -49,8 +49,8 @@ can perform well on training dataset but fail to generalize on testing dataset
    (note that the vx model is a DIY one and thus cannot be found there). We
    previously have downloaded a few weights into the *./pretrained* directory.
 
-   Note that we have modified some code (mostly removing the last few layers) of
-   those models to fit our object detection task.
+   Note that we have modified some code (removing the last few layers and change
+   the activation function) of some models to fit our object detection task.
 
  2. **examples**
 
@@ -76,7 +76,7 @@ can perform well on training dataset but fail to generalize on testing dataset
 
  7. **anchors.py**
 
-    This file contains anchors definition
+    This file contains anchors definitions.
 
  8. **main.py**
 
@@ -207,7 +207,7 @@ model, see function `train()`; for testing the model, see function `test()`.
     for image labeling. Nevertheless it has to conform to the data format
     described above.
 
-### How to train/test and how to make improvement based on this project
+### III How to train/test and how to make improvement based on this project
 
 We use `main.py` to drive both training and testing. See `./main.py --help` for
 a full description.
@@ -273,12 +273,12 @@ You can also test multiple images at a time:
     --outdir predictions                                  # output directory
 ```
 
-#### How to make improvement based on this project
+### IIII How to make improvement based on this project
 
 I suppose you are a young researcher like me? Congratulation! Welcome to the new
 world of mysterious neural network training!
 
-##### Tips
+#### Tips
 
 Some lessons learned by me which may help you:
 
@@ -299,7 +299,7 @@ Some lessons learned by me which may help you:
  5. Commit often, and write clear commit logs! You are the person who will read
     the code most of the time following, so be nice to yourself.
 
-##### What to get from this project
+#### What to get from this project
 
 I think you should look at the code yourself. But I will try to provide you some
 useful pointers:
@@ -330,7 +330,7 @@ useful pointers:
     [specific tensorflow mailing lists](https://www.tensorflow.org/community/lists).
 
 
-##### Some caveat about this project.
+#### Some caveat about this project.
 
  1. We have changed the internal activation function of most backbone network
     from `tf.nn.relu()` to `tf.nn.leaky_relu()`, which can help the model to
@@ -342,18 +342,19 @@ useful pointers:
     To solve this, you can 1) decrease the `starter_learning_rate` or 2)
     decrease the `batch_size`.
 
-##### Where to get help
+#### Where to get help
 
  2. Here is my [email](ablacktshirt@gmail.com). Draw me some lines if needed. I
     reply emails.
 
 
-### How to converted this model to tflite
+### V How to converted this model to tflite
 
 Basically we are following
-[this](https://codelabs.developers.google.com/codelabs/tensorflow-for-poets/#0)) and
+[this](https://codelabs.developers.google.com/codelabs/tensorflow-for-poets/#0) and
 [this](https://codelabs.developers.google.com/codelabs/tensorflow-for-poets-2-tflite/#0)
-tutorial to convert a model to tflite.
+tutorial to convert a model to tflite. But due to tflite's limitation
+(see below) we **have not successfully completed that yet**.
 
 We are using the `toco` tool, whose docs can be found
 [here](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/lite/toco/g3doc/).
@@ -384,18 +385,18 @@ And then use this command to generate a tflite model
 
 But note that:
 
-    1. Currently `toco` does not support batch normalization correctly
-    (see [this issue](https://github.com/tensorflow/tensorflow/issues/15336)
-     and [this issue](https://github.com/tensorflow/tensorflow/issues/17684))
-     So to convert a model to tflite, it cannot have batch normalization.
-     Therefore, we can only use VGG and VX for backbone and remove batch
-     normalization code from other convolutional layers.
+ 1. Currently `toco` does not support batch normalization correctly
+ (see [this issue](https://github.com/tensorflow/tensorflow/issues/15336)
+  and [this issue](https://github.com/tensorflow/tensorflow/issues/17684))
+  So to convert a model to tflite, it cannot have batch normalization.
+  Therefore, we can only use VGG and VX for backbone and remove batch
+  normalization code from other convolutional layers.
 
-    2. Currently (for tensorflow 1.6 that we are using) there are lots of
-    operators not supported by `toco`, including
+ 2. Currently (for tensorflow 1.6 that we are using) there are lots of
+ operators not supported by `toco`, including
 
-    > CAST, ExpandDims, FLOOR, Fill, Pow, RandomUniform, SPLIT, Stack, TensorFlowGreater, TensorFlowMaximum, TensorFlowMinimum, TensorFlowShape, TensorFlowSum, TensorFlowTile
+ > CAST, ExpandDims, FLOOR, Fill, Pow, RandomUniform, SPLIT, Stack, TensorFlowGreater, TensorFlowMaximum, TensorFlowMinimum, TensorFlowShape, TensorFlowSum, TensorFlowTile
 
-    which are heavily used in our code. We have filed a
-    [issue](https://github.com/tensorflow/tensorflow/issues/20110) for that.
-    Please track that issue for future progress.
+ which are heavily used in our code. We have filed a
+ [issue](https://github.com/tensorflow/tensorflow/issues/20110) for that.
+ Please track that issue for future progress.
