@@ -779,7 +779,7 @@ def test():
                 saved_model_tags="serve"
             )
 
-        # TODO these method are only available in Tensorflow1.9. Use the cmd
+        # TODO the python API are only available in Tensorflow1.9. Use the cmd
         # `toco` instead:
         #
         #       IMAGE_SIZE=320
@@ -794,7 +794,11 @@ def test():
         #         --inference_type=FLOAT \
         #         --input_data_type=FLOAT
         #
-        #convert to tflite
+        # TODO as of this writing, lots of operation used in this project are
+        # not supported. So we cannot converted this model to tflite. See this
+        # issue:
+        #   https://github.com/tensorflow/tensorflow/issues/20110
+        #
         #input_arrays = ["input_images"]
         #output_arrays = ["output_num_array"]
         #converter = tf.contrib.lite.TocoConverter.from_frozen_graph(
@@ -806,51 +810,52 @@ def test():
         #tflite_output_path = "/tmp/mymodels/converted_model.tflite"
         #print("Writing converted tflite model to {}".format(tflite_output_path))
         #open(tflite_output_path, "wb").write(tflite_model)
-        #return
+        return
 
     restorer = tf.train.Saver(all_vars)
     restorer = restorer.restore(sess, FLAGS.checkpoint)
     tf.logging.info("checkpoint restored!")
 
     idx = 1
-    # trace/dump/profile at step one
-    with tf.contrib.tfprof.ProfileContext('/tmp/profile_dir',
-                                          trace_steps=[0],
-                                          dump_steps=[0]) as pctx:
-        #uncomment these to see flops benchmarks
-        # opts = tf.profiler.ProfileOptionBuilder.float_operation()
-        # pctx.add_auto_profiling('op', opts, [0])
+    # Profile the network structure
+    #
+    #with tf.contrib.tfprof.ProfileContext('/tmp/profile_dir',
+    #                                      trace_steps=[0],
+    #                                      dump_steps=[0]) as pctx:
+    #    #uncomment these to see flops benchmarks
+    #    opts = tf.profiler.ProfileOptionBuilder.float_operation()
+    #    pctx.add_auto_profiling('op', opts, [0])
+    #
+    while True:
+        (batch_xs, batch_xs_scale_info,
+         batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
+        if not len(batch_xs): break
+        sys.stdout.write("Testing batch[{}]...".format(idx))
+        idx += 1
+        sys.stdout.flush()
+        start_time = datetime.datetime.now()
+        final_images = sess.run(images_with_bboxes,
+                                feed_dict={
+                                    _x: batch_xs,
+                                    output_scale_placeholder: outscale
+                                },
+                                options=run_option)
+        elapsed_time = datetime.datetime.now() - start_time
+        sys.stdout.write(
+          "Prediction time: {} | Writing images...".format(elapsed_time)
+        )
 
-        while True:
-            (batch_xs, batch_xs_scale_info,
-             batch_xs_names, outscale) = image_handler.next_batch(FLAGS.batch_size)
-            if not len(batch_xs): break
-            sys.stdout.write("Testing batch[{}]...".format(idx))
-            idx += 1
-            sys.stdout.flush()
-            start_time = datetime.datetime.now()
-            final_images = sess.run(images_with_bboxes,
-                                    feed_dict={
-                                        _x: batch_xs,
-                                        output_scale_placeholder: outscale
-                                    },
-                                    options=run_option)
-            elapsed_time = datetime.datetime.now() - start_time
-            sys.stdout.write(
-              "Prediction time: {} | Writing images...".format(elapsed_time)
-            )
+        image_handler.write_batch(
+                        final_images,
+                        batch_xs_scale_info,
+                        batch_xs_names,
+                        FLAGS.multiple_images,
+                        FLAGS.outdir,
+                        FLAGS.outfile
+                      )
 
-            image_handler.write_batch(
-                            final_images,
-                            batch_xs_scale_info,
-                            batch_xs_names,
-                            FLAGS.multiple_images,
-                            FLAGS.outdir,
-                            FLAGS.outfile
-                          )
-
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 def eval():
     """Evaluate the current model (compute mAP and the like)."""

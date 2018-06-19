@@ -70,14 +70,15 @@ def backbone_network(images, backbone_arch, reuse):
                                             spatial_squeeze=False,
                                             reuse=reuse)
         vars_to_restore = slim.get_variables_to_restore()
-    #NOTE!! we are using tf.nn.relu instead of tf.nn.leaky_relu inside
-    #inception_v2, so most of the time you should freeze the backbone.
-    #For other architectures above, we have changed their internal
-    #activation functions from tf.nn.relu to tf.nn.leaky_relu, so most
-    #of the time you should not freeze the backbone when training. If
-    #you want to freeze the backbone when training, please change all
-    #tf.nn.leaky_relu back to tf.nn.relu so that the architectures come
-    #back to their original states after loading weights.
+    # NOTE!! we are using tf.nn.relu instead of tf.nn.leaky_relu inside
+    # inception_v2, so most of the time you should freeze the backbone.
+    # For other architectures above, we have changed their internal
+    # activation functions from tf.nn.relu to tf.nn.leaky_relu, so most
+    # of the time you should not freeze the backbone when training, because
+    # their internal network structures have changed anyway, so freezing them
+    # is meaningless. If you want to freeze the backbone when training, please
+    # change all tf.nn.leaky_relu back to tf.nn.relu so that the architectures
+    # come back to their original states after loading weights.
     elif backbone_arch == 'inception_v2':
         with slim.arg_scope(inception_arg_scope()):
             backbone_network, endpoints = inception_v2(
@@ -132,16 +133,19 @@ def YOLOvx(images, backbone_arch, num_anchor_boxes, num_classes=1,
     backbone, vars_to_restore = backbone_network(images, backbone_arch, reuse=reuse)
     # shortcut = shortcut_from_input(images)
 
+    #with slim.arg_scope([slim.conv2d],
+    #                    weights_initializer=trunc_normal(0.01),
+    #                    activation_fn=tf.nn.leaky_relu,
+    #                    normalizer_fn=slim.batch_norm,
+    #                    normalizer_params={
+    #                        'is_training': True,
+    #                        'decay':0.95,
+    #                        'epsilon': 0.001,
+    #                        'updates_collections': tf.GraphKeys.UPDATE_OPS,
+    #                        'fused': None}):
     with slim.arg_scope([slim.conv2d],
                         weights_initializer=trunc_normal(0.01),
-                        activation_fn=tf.nn.leaky_relu,
-                        normalizer_fn=slim.batch_norm,
-                        normalizer_params={
-                            'is_training': True,
-                            'decay':0.95,
-                            'epsilon': 0.001,
-                            'updates_collections': tf.GraphKeys.UPDATE_OPS,
-                            'fused': None}):
+                        activation_fn=tf.nn.leaky_relu):
 
         backbone = slim.conv2d(backbone, 1024, [3, 3], scope='backbone_refined_1')
         backbone = slim.conv2d(backbone, 1024, [3, 3], scope='backbone_refined_2')
@@ -465,16 +469,16 @@ class YOLOLoss():
         # lower than 0.5, so we think it is OK that we kind of "ignore" it.
         # nonobjectness_loss = 1 * tf.log(nonobjectness_loss_pre + 1)
         nonobjectness_loss = 0.1 * nonobjectness_loss_pre
-        objectness_loss = tf.Print(
-                objectness_loss,
-                [cooridniates_loss_pre, objectness_loss_pre, nonobjectness_loss_pre],
-                "cl & ol & nol (pre): "
-            )
-        objectness_loss = tf.Print(
-                objectness_loss,
-                [cooridniates_loss, objectness_loss, nonobjectness_loss],
-                "cl & ol & nol: "
-            )
+        #objectness_loss = tf.Print(
+        #        objectness_loss,
+        #        [cooridniates_loss_pre, objectness_loss_pre, nonobjectness_loss_pre],
+        #        "cl & ol & nol (pre): "
+        #    )
+        #objectness_loss = tf.Print(
+        #        objectness_loss,
+        #        [cooridniates_loss, objectness_loss, nonobjectness_loss],
+        #        "cl & ol & nol: "
+        #    )
 
         tf.summary.scalar("cooridniates_loss", cooridniates_loss)
         tf.summary.scalar("objectness_loss", objectness_loss)

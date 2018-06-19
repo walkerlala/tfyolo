@@ -14,15 +14,16 @@ This README will guide you through:
 
 Basically we are doing Object Detection here. We build a  deep neural network
 similar to that of YOLO and try to simplified the network structure so that it
-can run faster and more accurate. But we haven't out-performed yet (sigh!). We
-have successfully trained several models which can perform well on training
-dataset but fail to generalize on testing dataset (i.e., overfitting).
+can run faster and more accurate. But we haven't out-performed YOLO (the darknet
+implementation) yet (sigh!). We have successfully trained several models which
+can perform well on training dataset but fail to generalize on testing dataset
+(i.e., overfitting).
 
 ### Source code/file organization
 
-####Source files organzation
+#### Source files organzation
 
- 1. backbone
+ 1. **backbone**
 
     This directory contains backbone network structures. As of this writing we
     have 'vgg_16', 'inception_v1', 'inception_v2', 'resnet_v2' and a DIY 'vx'
@@ -31,67 +32,70 @@ dataset but fail to generalize on testing dataset (i.e., overfitting).
     The reason why we have these network backbone is that our model is based on
     the following schema:
 
-```
+    ```
               +---------+    +--------+
     input =>  |         | => |        | => output bounding boxes predictions
               +---------+    +--------+
                backbone     conv' layers
-```
+    ```
+
    the backbone layer are well-trained on classification task (such as ImageNet)
    so that it can extract various features from pictures. we then stack a few
-   convolutional layers on top of that backbone for prediction bounding boxes.
+   convolutional layers on top of that backbone for predicting bounding boxes.
 
    So, to use those backbones, you have to obtain their parameter weights, which
    can be downloaded from
    [here](https://github.com/tensorflow/models/tree/master/research/slim#pre-trained-models).
-   (note that the vx model is a DIY one).
+   (note that the vx model is a DIY one and thus cannot be found there). We
+   previously have downloaded a few weights into the *./pretrained* directory.
 
    Note that we have modified some code (mostly removing the last few layers) of
-   those model to fit our object detection task.
+   those models to fit our object detection task.
 
- 2. examples
+ 2. **examples**
 
     This directory contains example testing pictures.
 
- 3. networks
+ 3. **networks**
 
     This directory contains source code for the core network structure (which is
     called YOLOvx).
 
- 4. predictions
+ 4. **predictions**
 
-    This directory contains the prediction output of the testing pictures.
+    This directory (should) contain(s) the prediction output of the testing pictures.
 
- 5. pretrained
+ 5. **pretrained**
 
-    This directory contains the pretrained weight downloaded from
+    This directory contains the pretrained weights previously downloaded from
     [tensorflow-model](https://github.com/tensorflow/models/tree/master/research/slim#pre-trained-models).
-    previously
 
- 6. utils
+ 6. **utils**
 
     This directory contains utilization code for reading/writing data and drawing images.
 
- 7. anchors.py
+ 7. **anchors.py**
 
     This file contains anchors definition
 
- 8. main.py
+ 8. **main.py**
 
     This file is used to run the whole model (that is why it is called main.py)
 
-####Source code organzation
-If you want to read the source code, start from **main.py**. For training the
+#### Source code organzation
+
+If you want to read the source code, start from *main.py*. For training the
 model, see function `train()`; for testing the model, see function `test()`.
 (and ignore the `eval()` function for this moment).
 
  1. How `train()` trains the model
 
-    To understand this problem, you have know how Tensorflow works. Basically
-    in Tensorflow you define a *static* graph and then use this graph to train
+    To understand this, you have know how Tensorflow works. Basically in
+    Tensorflow you define a *static* graph and then use this graph to train
     the model for many times. 
 
     So we define the neural network as follow:
+
     ```
     _x = tf.placeholder(tf.float32, [None, None, None, 3])
     _y, vars_to_restore = YOLOvx(
@@ -132,14 +136,14 @@ model, see function `train()`; for testing the model, see function `test()`.
                  )
     ```
 
-    So far we have contructed the whole model for training. But
-    **note that we have just contructed a static graph!!!**. When the Python
-    intepreter reach this point, it will contruct a static graph, but there is
-    no training done yet.
+    Note that `train_step` depends on `loss`, `loss` depends on `_y`, and `_y`
+    depends on `_x`. So when you run `train_step`, it will drives the whole
+    graph!
 
-    One more thing you have to know: `train\_step` depends on `loss`, `loss`
-    depends on `_y`, and `_y` depends on `_x`. So when you run `train\_step`, it
-    will drives the whole graph!
+    With these we have contructed the whole model for training. But
+    **note that we have just contructed a static graph!!!**. When the Python
+    intepreter reaches this point, it will contruct a static graph, but there is
+    no training done yet.
 
     To train the model, you have to feed data into `_x`, run the network,
     get the loss and perform gradient descent; and then feed data into `_x`
@@ -150,25 +154,31 @@ model, see function `train()`; for testing the model, see function `test()`.
 
     Basically it follow the same schema in `train()`.
 
- 3. How YOLOvx is contructed. See function `YOLOvx()` in *networks/yolovx.py*.
+ 3. How YOLOvx is contructed.
+ 
+    See function `YOLOvx()` in *networks/yolovx.py*.
 
- 4. How the loss is defined. See function `calculate_loss()` in
-    *networks/yolovx.py*. Note that this function contains some complicated
-    Tensorflow operations. You should know how YOLO do the loss calculation
-    (see the YOLO v1 paper) before trying to read that.
+ 4. How the loss is defined.
+ 
+    See function `calculate_loss()` in *networks/yolovx.py*. Note that this
+    function contains some complicated Tensorflow operations. You should
+    first understand how YOLO do the loss calculation (see the YOLO v1 paper)
+    before trying to read that.
 
  5. How we handle data reading/writing
 
     Functions for reading/writing data is defined in *utils/dataset.py*. We
     assume the training data follow the YOLO/darknet dataset schema. For
-    example, if you have a training image **/path/to/somepicture.jpg**, you
-    should put a file **/path/to/somepicture.txt**. containing the
+    example, if you have a training image */path/to/somepicture.jpg*, you
+    should put a file */path/to/somepicture.txt* containing the
     corresponding annotations for that image. Note that these two files should
-    be put *in the same directory(!!)*. Inside **/path/to/somepicture.txt**,
+    be put **in the same directory(!!)**. Inside **/path/to/somepicture.txt**,
     there are multiple lines of annotation, each line indicating a bounding box.
     For example, a line:
 
-    > 0  0.08671875  0.329861111111  0.0546875  0.115277777778
+    ```
+    0   0.08671875   0.329861111111   0.0546875   0.115277777778
+    ```
 
     the first column is the classness; the second column is the x coordinate of
     the box center (relative to the whole image); the third is the y coordinate
@@ -176,7 +186,7 @@ model, see function `train()`; for testing the model, see function `test()`.
     the box (relative to the whole image); the fourth is the height of the box
     (relative to whole image).
 
-    Inside **utils/dataset.py**, we transformed the x/y coordinates of the box
+    Inside *utils/dataset.py*, we transformed the x/y coordinates of the box
     from *relative to whole image* to be *relative to a single cell* (see the
     YOLO papers for what a cell means).
 
@@ -186,19 +196,21 @@ model, see function `train()`; for testing the model, see function `test()`.
 
     As of this writing, most of the labeled data is stored at `/disk1/labeled/`.
 
-    If you want to annotate more data for training, you can use this tool:
+    If you want to annotate more data for training, you can use this tool
 
-        https://github.com/tzutalin/labelImg
+    https://github.com/tzutalin/labelImg
+
     or
-        https://github.com/AlexeyAB/Yolo_mark
+
+    https://github.com/AlexeyAB/Yolo_mark
 
     for image labeling. Nevertheless it has to conform to the data format
     described above.
 
 ### How to train/test and how to make improvement based on this project
 
-    We use `main.py` to drive training and testing. See `./main.py --help` for a
-    complete description.
+We use `main.py` to drive both training and testing. See `./main.py --help` for
+a full description.
     
 #### Training
 
@@ -251,7 +263,6 @@ model, see function `train()`; for testing the model, see function `test()`.
 
 You can also test multiple images at a time:
 
-
 ```
 ./main.py --test                                        \ # 
     --backbone inception_v1                             \ # backbone
@@ -262,3 +273,129 @@ You can also test multiple images at a time:
     --outdir predictions                                  # output directory
 ```
 
+#### How to make improvement based on this project
+
+I suppose you are a young researcher like me? Congratulation! Welcome to the new
+world of mysterious neural network training!
+
+##### Tips
+
+Some lessons learned by me which may help you:
+
+ 1. Most ideas do not work, so if you want to lay a good foundation, be patient.
+
+ 2. Test your models thoroughly before truely believing that it works.
+
+ 3. Try to visualize your model at the time of training. But also note that
+    training a workable neural network is not easy and usually takes hours, so
+    keep yourself easy.
+
+ 4. Try to get more data and try again.
+
+ 5. Code style matters. Write your code clearly and write comments if necessary.
+    Try to learn from how
+    [Googler write code](https://github.com/tensorflow/models).
+
+ 5. Commit often, and write clear commit logs! You are the person who will read
+    the code most of the time following, so be nice to yourself.
+
+##### What to get from this project
+
+I think you should look at the code yourself. But I will try to provide you some
+useful pointers:
+
+ 1. `tf.slim` is great for constructing neural networks. And we are using it
+    heavily in our code. See its
+    [tutorial](https://github.com/tensorflow/tensorflow/tree/master/tensorflow/contrib/slim).
+
+ 2. The official [tensorflow-model](https://github.com/tensorflow/models) repo
+    contains lots of pre-built model using tensorflow. For the object detection
+    task, look at its
+    [object detection directory](https://github.com/tensorflow/models/tree/master/research/object_detection)
+    for various models built with Tensorflow. Note that these models are often
+    in active development and are not necessary the ones used in Google
+    internally, so things may break from time to time.
+
+ 3. The official YOLO implementation is implemented using C. Here is its
+    [official website](https://pjreddie.com/darknet/yolo/). We have clone the
+    repo into */home/yubin/project/darknet* and write some notes in the
+    *README2.md* file.
+
+ 4. There are a darknet fork [here](https://github.com/AlexeyAB/darknet). Its
+    README file are very comprehansive.
+
+ 5. If you have any question about Tensorflow, go to
+    [Stackoverflow](https://stackoverflow.com/questions/tagged/tensorflow?sort=newest&pageSize=15)
+    or post it in 
+    [specific tensorflow mailing lists](https://www.tensorflow.org/community/lists).
+
+
+##### Some caveat about this project.
+
+ 1. We have changed the internal activation function of most backbone network
+    from `tf.nn.relu()` to `tf.nn.leaky_relu()`, which can help the model to
+    fit the data better. *But*, one drawback about leaky_relu is that is will
+    sometimes explode the network. So sometimes you will have errors like
+
+    > InvalidArgumentError (see above for traceback): LossTensor is inf or nan: Tensor had NaN values
+
+    To solve this, you can 1) decrease the `starter_learning_rate` or 2)
+    decrease the `batch_size`.
+
+##### Where to get help
+
+ 2. Here is my [email](ablacktshirt@gmail.com). Draw me some lines if needed. I
+    reply emails.
+
+
+### How to converted this model to tflite
+
+Basically we are following
+[this](https://codelabs.developers.google.com/codelabs/tensorflow-for-poets/#0)) and
+[this](https://codelabs.developers.google.com/codelabs/tensorflow-for-poets-2-tflite/#0)
+tutorial to convert a model to tflite.
+
+We are using the `toco` tool, whose docs can be found
+[here](https://github.com/tensorflow/tensorflow/blob/master/tensorflow/contrib/lite/toco/g3doc/).
+
+First generate a frozen tensorflow graph by
+
+```
+./main.py --test         \
+    --only_export_tflite \
+    --backbone vgg_16    \
+    --checkpoint /disk1/yolockpts/run-tflite-vgg/model.ckpt-500
+```
+
+And then use this command to generate a tflite model
+(or the API in *main.py*, if you are using tensorflow-1.9)
+
+```
+ toco --input_file=/tmp/mymodels/model_frozen.pb        \
+    --output_file=/tmp/mymodels/converted_model.tflite  \
+    --input_format=TENSORFLOW_GRAPHDEF                  \
+    --output_format=TFLITE                              \
+    --input_shape=1,320,320,3                           \
+    --input_array=input_images                          \
+    --output_array=output_num_array                     \
+    --inference_type=FLOAT                              \
+    --input_data_type=FLOAT
+```
+
+But note that:
+
+    1. Currently `toco` does not support batch normalization correctly
+    (see [this issue](https://github.com/tensorflow/tensorflow/issues/15336)
+     and [this issue](https://github.com/tensorflow/tensorflow/issues/17684))
+     So to convert a model to tflite, it cannot have batch normalization.
+     Therefore, we can only use VGG and VX for backbone and remove batch
+     normalization code from other convolutional layers.
+
+    2. Currently (for tensorflow 1.6 that we are using) there are lots of
+    operators not supported by `toco`, including
+
+    > CAST, ExpandDims, FLOOR, Fill, Pow, RandomUniform, SPLIT, Stack, TensorFlowGreater, TensorFlowMaximum, TensorFlowMinimum, TensorFlowShape, TensorFlowSum, TensorFlowTile
+
+    which are heavily used in our code. We have filed a
+    [issue](https://github.com/tensorflow/tensorflow/issues/20110) for that.
+    Please track that issue for future progress.
